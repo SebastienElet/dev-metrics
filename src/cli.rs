@@ -28,6 +28,22 @@ pub enum Command {
         #[arg(long, value_enum, default_value = "json")]
         format: Format,
     },
+    #[command(about = "Collecter l'activité Bitbucket Cloud sur une période UTC")]
+    Bitbucket {
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        from: String,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        to: String,
+        #[arg(long, help = "Workspace Bitbucket (par défaut : configuration)")]
+        workspace: Option<String>,
+        #[arg(
+            long,
+            help = "UUID Bitbucket ou Account ID Atlassian (par défaut : compte authentifié)"
+        )]
+        user: Option<String>,
+        #[arg(long, value_enum, default_value = "json")]
+        format: Format,
+    },
     #[command(about = "Rapport de métriques (non implémenté)")]
     Report,
     #[command(about = "Planification des rapports (non implémentée)")]
@@ -47,6 +63,40 @@ mod tests {
     #[test]
     fn parses_schedule() {
         assert!(Cli::try_parse_from(["dev-metrics", "schedule"]).is_ok());
+    }
+
+    #[test]
+    fn parses_bitbucket_workspace_user_and_format() {
+        for format in ["json", "table"] {
+            assert!(
+                Cli::try_parse_from([
+                    "dev-metrics",
+                    "bitbucket",
+                    "--from",
+                    "2026-10-01",
+                    "--to",
+                    "2026-10-07",
+                    "--workspace",
+                    "team",
+                    "--user",
+                    "alice",
+                    "--format",
+                    format
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "dev-metrics",
+                "bitbucket",
+                "--from",
+                "2026-10-01",
+                "--to",
+                "2026-10-07"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

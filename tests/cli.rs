@@ -15,6 +15,7 @@ fn help_works_without_home_or_config() {
         vec!["report", "--help"],
         vec!["schedule", "--help"],
         vec!["github", "--help"],
+        vec!["bitbucket", "--help"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
             .args(arguments)
@@ -166,5 +167,60 @@ fn github_rejects_missing_dates_invalid_periods_and_unknown_formats() {
             .unwrap();
         assert!(!output.status.success());
         assert!(stdout(&output).is_empty());
+    }
+}
+
+#[test]
+fn bitbucket_resolves_workspace_and_token_without_printing_partial_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    for (config, args, env, expected) in [
+        (
+            "output_dir='reports'",
+            vec![],
+            None,
+            "Workspace Bitbucket absent",
+        ),
+        (
+            "output_dir='reports'\n[bitbucket]\nworkspace='team'",
+            vec![],
+            None,
+            "Authentification Bitbucket absente",
+        ),
+        (
+            "output_dir='reports'\n[bitbucket]\nworkspace='bad/path'",
+            vec!["--workspace", "team"],
+            None,
+            "Authentification Bitbucket absente",
+        ),
+        (
+            "output_dir='reports'\n[bitbucket]\nworkspace='team'\ntoken='configured-secret'",
+            vec![],
+            Some("invalid secret"),
+            "Token Bitbucket invalide",
+        ),
+        (
+            "output_dir='reports'\n[bitbucket]\nworkspace='team'",
+            vec!["--workspace", "../bad"],
+            Some("env-secret"),
+            "Workspace Bitbucket invalide",
+        ),
+    ] {
+        std::fs::write(&path, config).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_dev-metrics"));
+        command
+            .args(["bitbucket", "--from", "2026-10-01", "--to", "2026-10-07"])
+            .args(args)
+            .arg("--config")
+            .arg(&path)
+            .env_remove("BITBUCKET_TOKEN");
+        if let Some(token) = env {
+            command.env("BITBUCKET_TOKEN", token);
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        assert!(stdout(&output).is_empty());
+        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
+        assert!(!stderr(&output).contains("secret"));
     }
 }

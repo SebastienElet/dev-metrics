@@ -38,6 +38,7 @@ impl Period {
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     GitHub,
+    Bitbucket,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -134,10 +135,10 @@ pub struct Activity {
 }
 
 impl Activity {
-    pub(crate) fn empty(user: &str, period: Period) -> Self {
+    pub(crate) fn empty(source: Source, user: &str, period: Period) -> Self {
         Self {
             schema_version: 1,
-            source: Source::GitHub,
+            source,
             user: user.into(),
             period,
             pull_requests: Vec::new(),
@@ -145,6 +146,21 @@ impl Activity {
             reviews_received: Vec::new(),
             comments: Vec::new(),
             commits: Vec::new(),
+        }
+    }
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::Bitbucket => "bitbucket",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::Bitbucket => "Bitbucket",
         }
     }
 }

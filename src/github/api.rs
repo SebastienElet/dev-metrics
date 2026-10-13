@@ -1,4 +1,4 @@
-use super::model::{FileChange, ReviewState};
+use crate::activity::{FileChange, ReviewState};
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK};

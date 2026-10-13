@@ -1,17 +1,21 @@
-use super::{Activity, CommentKind};
+use super::{Activity, CommentKind, Source};
 use chrono::{DateTime, SecondsFormat, Utc};
 
 impl Activity {
     pub fn table(&self) -> String {
         let mut rows = vec![
             format!(
-                "GitHub · {} · {} → {} (UTC)",
-                self.user, self.period.from, self.period.to
+                "{} · {} · {} → {} (UTC)",
+                self.source.label(),
+                self.user,
+                self.period.from,
+                self.period.to
             ),
             "Source | Dépôt | Activité | Référence | Date UTC | Ajouts | Suppressions".into(),
         ];
         for pr in &self.pull_requests {
             rows.push(row(
+                self.source,
                 &pr.repository,
                 "PR",
                 &format!("#{}", pr.number),
@@ -20,6 +24,7 @@ impl Activity {
             ));
             if let Some(merged) = pr.merged_at {
                 rows.push(row(
+                    self.source,
                     &pr.repository,
                     "merge",
                     &format!("#{}", pr.number),
@@ -29,6 +34,7 @@ impl Activity {
             }
             if let Some(review) = pr.first_review_received_at {
                 rows.push(row(
+                    self.source,
                     &pr.repository,
                     "première review",
                     &format!("#{}", pr.number),
@@ -43,6 +49,7 @@ impl Activity {
         ] {
             for review in reviews {
                 rows.push(row(
+                    self.source,
                     &review.repository,
                     label,
                     &format!("#{}/review:{}", review.pull_request_number, review.id),
@@ -57,6 +64,7 @@ impl Activity {
                 CommentKind::Review => "commentaire review",
             };
             rows.push(row(
+                self.source,
                 &comment.repository,
                 label,
                 &format!("#{}/comment:{}", comment.issue_number, comment.id),
@@ -66,6 +74,7 @@ impl Activity {
         }
         for commit in &self.commits {
             rows.push(row(
+                self.source,
                 &commit.repository,
                 "commit",
                 &commit.sha,
@@ -81,6 +90,7 @@ impl Activity {
 }
 
 fn row(
+    source: Source,
     repository: &str,
     activity: &str,
     reference: &str,
@@ -91,7 +101,8 @@ fn row(
         (a.to_string(), d.to_string())
     });
     format!(
-        "github | {repository} | {activity} | {reference} | {} | {added} | {deleted}",
+        "{} | {repository} | {activity} | {reference} | {} | {added} | {deleted}",
+        source.as_str(),
         date.to_rfc3339_opts(SecondsFormat::AutoSi, true)
     )
 }

@@ -1,0 +1,361 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SebastienElet/dev-metrics/blob/main/schemas/activity-v1.schema.json",
+  "title": "Activit\u00e9 brute GitHub ou Bitbucket v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source",
+    "user",
+    "period",
+    "pull_requests",
+    "reviews_given",
+    "reviews_received",
+    "comments",
+    "commits"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "source": {
+      "enum": [
+        "github",
+        "bitbucket"
+      ]
+    },
+    "user": {
+      "type": "string"
+    },
+    "period": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "format": "date"
+        },
+        "to": {
+          "type": "string",
+          "format": "date"
+        }
+      }
+    },
+    "pull_requests": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/pull_request"
+      }
+    },
+    "reviews_given": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/review"
+      }
+    },
+    "reviews_received": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/review"
+      }
+    },
+    "comments": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/comment"
+      }
+    },
+    "commits": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/commit"
+      }
+    }
+  },
+  "$defs": {
+    "file_change": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "previous_path",
+        "additions",
+        "deletions"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "previous_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "additions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletions": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "pull_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "repository",
+        "number",
+        "author",
+        "title",
+        "url",
+        "created_at",
+        "merged_at",
+        "first_review_received_at",
+        "additions",
+        "deletions",
+        "files"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "github",
+            "bitbucket"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$"
+        },
+        "number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "author": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "merged_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "first_review_received_at": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "additions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file_change"
+          }
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "repository",
+        "pull_request_number",
+        "id",
+        "author",
+        "submitted_at",
+        "state",
+        "url"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "github",
+            "bitbucket"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$"
+        },
+        "pull_request_number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "author": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "submitted_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "state": {
+          "enum": [
+            "APPROVED",
+            "CHANGES_REQUESTED",
+            "COMMENTED",
+            "DISMISSED"
+          ]
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        }
+      }
+    },
+    "comment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "repository",
+        "issue_number",
+        "id",
+        "author",
+        "created_at",
+        "url",
+        "kind"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "github",
+            "bitbucket"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$"
+        },
+        "issue_number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "author": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "kind": {
+          "enum": [
+            "discussion",
+            "review"
+          ]
+        }
+      }
+    },
+    "commit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "repository",
+        "sha",
+        "message",
+        "url",
+        "authored_at",
+        "additions",
+        "deletions",
+        "files"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "github",
+            "bitbucket"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$"
+        },
+        "sha": {
+          "type": "string",
+          "pattern": "^[A-Fa-f0-9]+$"
+        },
+        "message": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "authored_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "additions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "deletions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file_change"
+          }
+        }
+      }
+    }
+  }
+}
