@@ -1083,3 +1083,67 @@ fn refuses_duplicate_pull_requests_within_one_search() {
             .contains("dupliqués")
     );
 }
+
+#[test]
+fn common_source_collects_metrics_with_explicit_or_authenticated_identity() {
+    use dev_metrics::metrics::{MetricsConfig, SourceRequest, collect};
+    for user in [Some("octocat"), None] {
+        let mut server = Server::new();
+        endpoint(&mut server, "/user", json!({"login":"octocat"}));
+        for query in [
+            "is:pr author:octocat updated:>=2026-09-01",
+            "is:pr reviewed-by:octocat updated:>=2026-09-01",
+            "is:pr commenter:octocat updated:>=2026-09-01",
+            "is:issue commenter:octocat updated:>=2026-09-01",
+        ] {
+            let candidates = if query.contains("author:") {
+                vec![issue(7, true)]
+            } else {
+                vec![]
+            };
+            search(&mut server, "/search/issues", query, candidates);
+        }
+        search(
+            &mut server,
+            "/search/commits",
+            "author:octocat author-date:2026-09-01..2026-10-30",
+            vec![],
+        );
+        let files = vec![file("src/main.rs", 10, 2), file("Cargo.lock", 1000, 0)];
+        mock_pr(
+            &mut server,
+            pr_detail(
+                7,
+                "octocat",
+                "2026-10-24T00:00:00Z",
+                Some("2026-10-25T00:00:00Z"),
+                &files,
+            ),
+            files,
+            vec![review(
+                8,
+                Some("alice"),
+                Some("2026-10-24T12:00:00Z"),
+                "APPROVED",
+            )],
+            vec![],
+            vec![],
+        );
+        let source = source(&server);
+        let report = collect(
+            &[SourceRequest {
+                source: &source,
+                user,
+            }],
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
+            &MetricsConfig::default(),
+        )
+        .unwrap();
+        let week = &report.windows[0].metrics;
+        assert_eq!(week.pull_requests_merged.current, Some(1.0));
+        assert_eq!(week.median_merge_seconds.current, Some(86_400.0));
+        assert_eq!(week.median_first_review_seconds.current, Some(43_200.0));
+        assert_eq!(week.median_pull_request_lines.current, Some(12.0));
+        assert_eq!(week.reviews_received.current, Some(1.0));
+    }
+}

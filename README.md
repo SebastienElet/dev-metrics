@@ -4,8 +4,8 @@ CLI Rust pour suivre ses métriques de développement (GitHub, Bitbucket).
 
 Les commandes `github` et `bitbucket` collectent l'activité brute sur une période et la restituent en
 JSON versionné ou en tableau. `report` et `schedule` restent des placeholders :
-les métriques agrégées sur 7/30 jours, leurs deltas et la planification ne sont pas
-encore implémentés.
+le moteur de calcul 7/30 jours est disponible dans la bibliothèque ; son exposition
+CLI (JSON/tableau, #5) et la planification restent à implémenter.
 
 ## Installation
 
@@ -112,14 +112,14 @@ est représenté par `null` sur les PRs et reviews ; une review soumise d'un aut
 supprimé reste une review reçue sur une PR de l'utilisateur.
 
 Les statistiques restent brutes : les lockfiles et fichiers générés sont conservés
-pour permettre leur exclusion configurable lors du calcul des métriques (#4).
+pour leur exclusion configurable dans le moteur de calcul des métriques.
 Les lignes des PRs et celles des commits décrivent des vues différentes du même
 travail et ne doivent pas être additionnées. Les commentaires de commits et les
 corps des commentaires ne sont pas collectés.
 
 `--format table` affiche ces données brutes, y compris les dates historiques utiles
-pour les PRs retenues. Il ne calcule pas encore les fenêtres 7/30 jours et leurs
-deltas (#4/#5). Une évolution incompatible du contrat JSON nécessitera une nouvelle
+pour les PRs retenues. Le rendu CLI des fenêtres 7/30 jours et de leurs
+deltas relève de #5. Une évolution incompatible du contrat JSON nécessitera une nouvelle
 version du schéma. Les listes vides sont des tableaux vides, les dates absentes
 valent `null`.
 
@@ -193,7 +193,7 @@ Seuls les commits attribués par l'API à l'UUID de l'utilisateur et datés dans
 période sont retenus : aucune identité n'est déduite d'un nom ou d'une adresse email.
 Le diffstat d'un commit compare son premier parent. Les diffstats paginés des PRs
 et commits conservent tous les chemins, renommages, suppressions et statistiques,
-y compris les lockfiles/générés, pour les exclusions de #4.
+y compris les lockfiles/générés, pour les exclusions du moteur de métriques.
 
 La pagination suit les liens `next`, y compris les curseurs opaques. Les
 redirections du diffstat de PR sont suivies uniquement dans la même origine et
@@ -207,7 +207,89 @@ La collecte parcourt l'historique accessible des dépôts et PRs du workspace et
 peut coûter beaucoup de requêtes sur un grand workspace. Elle ne reconstruit pas
 les événements supprimés/inaccessibles. Les diffstats de PR reflètent le diff
 actuel, pas une photographie historique. `--format table` restitue l'activité
-brute ; agrégations 7/30 jours et deltas restent aux issues #4/#5.
+brute ; le rendu CLI des agrégations 7/30 jours et des deltas relève de #5.
+
+## Calcul des métriques
+
+La bibliothèque expose `metrics::calculate(activities, through, config)` pour des
+activités déjà collectées et `metrics::collect(sources, through, config)` pour
+collecter puis calculer. `through` est une date de fin explicite (`NaiveDate`),
+inclusive en UTC. `SourceRequest` associe un `&dyn ActivitySource` à un utilisateur
+optionnel ; `GitHubSource` et `BitbucketSource` implémentent ce trait en réutilisant
+leur collecte existante. Une identité absente désigne le compte authentifié.
+
+Une collecte par source couvre les 60 jours nécessaires aux deux fenêtres et à
+leurs périodes précédentes. Pour une fin au 30 octobre 2026 :
+
+| Fenêtre | Période courante | Période précédente |
+| --- | --- | --- |
+| 7 jours | 24–30 octobre | 17–23 octobre |
+| 30 jours | 1–30 octobre | 1–30 septembre |
+
+`calculate` exige que chaque activité couvre ces 60 jours et refuse plusieurs
+collectes pour la même source afin d'éviter le double comptage. Une erreur de
+collecte, un délai négatif ou un dépassement des compteurs de lignes échoue sans
+retourner de rapport partiel. Une entrée vide produit des volumes nuls.
+
+`MetricsReport` fournit deux fenêtres, puis les mêmes calculs par source et par
+couple `(source, repository)`. GitHub précède Bitbucket ; les dépôts sont triés par
+nom au sein de chaque source. Une source fournie sans activité conserve ses
+fenêtres vides ; les dépôts proviennent des événements collectés, y compris ceux
+avec uniquement des reviews ou commentaires. Les agrégats recalculent les
+médianes et proportions sur toutes les observations, sans moyenner les résultats
+par dépôt ou par source. Les identités sont comparées sans tenir compte de la
+casse sur GitHub et exactement sur Bitbucket.
+
+Les conventions de calcul sont :
+
+- **Volume** : PRs de l'utilisateur créées ou mergées dans la fenêtre ; commits
+  attribués à l'utilisateur, selon leur date d'auteur. Les lignes ajoutées et
+  supprimées viennent des fichiers de ces commits, après exclusions. Les lignes
+  des PRs ne s'ajoutent pas au volume des commits.
+- **Vitesse** : médiane ouverture → merge des PRs de l'utilisateur mergées dans
+  la fenêtre ; médiane ouverture → première review des PRs de l'utilisateur dont
+  la première review reçue tombe dans la fenêtre, même si leur ouverture est
+  antérieure. Les durées sont exprimées en secondes. Les événements postérieurs
+  à la fin de la fenêtre sont exclus.
+- **Taille** : médiane des additions + suppressions, après exclusions, sur les
+  PRs de l'utilisateur créées dans la fenêtre. La part des PRs strictement
+  supérieures à 400 lignes est exprimée en pourcentage (0–100). Une PR dont tous
+  les fichiers sont exclus conserve une taille de zéro.
+- **Reviews** : nombre d'actions dans `reviews_given` sur les PRs des autres,
+  nombre de commentaires dans `comments` et nombre d'actions dans
+  `reviews_received` sur ses PRs, filtrés par leur date. Les conventions de chaque
+  source sont conservées : un commentaire de PR Bitbucket peut compter à la fois
+  comme review faite et comme commentaire laissé.
+
+Chaque `Comparison` contient `current`, `previous`, `delta` (courant − précédent)
+et `delta_percent` ((courant − précédent) / précédent × 100). Pour une proportion,
+`delta` est une différence en points de pourcentage. Une médiane ou proportion
+sans observations est absente (`None`), ainsi que ses deltas si l'une des valeurs
+comparées est absente. Un précédent nul donne un pourcentage absent, sauf si le
+courant est aussi nul : le delta en pourcentage vaut alors zéro.
+
+### Exclusions configurables
+
+La section TOML optionnelle `[metrics]` alimente `Config.metrics` :
+
+```toml
+[metrics]
+excluded_files = ["Cargo.lock", "package-lock.json", "generated/*", "*.snap"]
+```
+
+La liste explicite **remplace** les défauts ; `excluded_files = []` désactive
+les exclusions. Sans liste explicite, les défauts de `MetricsConfig::default()`
+excluent les lockfiles courants Rust, JavaScript, PHP, Python, Ruby, Go et .NET,
+les fichiers `*.min.js`, `*.min.css`, `*.generated.*` et les répertoires
+`generated`, `dist`, `build` à toute profondeur. Cette liste est une convention
+par nom, pas une détection exhaustive des fichiers générés.
+
+Un motif sans `/` s'applique au nom du fichier à toute profondeur ; un motif avec
+`/` s'applique au chemin relatif complet. `*` représente zéro ou plusieurs
+caractères, y compris `/` ; `?` représente un caractère Unicode. Les autres
+caractères sont littéraux, sans classes ni négation. La casse est significative.
+Un fichier renommé est exclu si son ancien ou son nouveau chemin correspond.
+Les données brutes et les exclusions utilisées par un appelant restent intactes.
 
 ## Développement
 
@@ -224,7 +306,9 @@ sources GitHub et Bitbucket utilisent des réponses HTTP simulées avec `mockito
 collecte, la pagination, les dates, les erreurs, les redirections Bitbucket et les sorties. Les snapshots
 JSON/tableau et le moteur `jsonschema` vérifient le contrat de sortie. Les tests
 d'authentification utilisent des exécutables temporaires sous Unix, sans accéder
-aux identifiants de la machine. Ils ne prouvent pas l'exhaustivité des données accessibles ni une collecte Bitbucket réelle.
+aux identifiants de la machine. Les tests unitaires de métriques utilisent des jeux
+de données fixes pour les fenêtres, deltas, médianes, exclusions et répartitions ;
+les tests HTTP simulés exercent aussi le raccordement au trait commun de collecte. Ils ne prouvent pas l'exhaustivité des données accessibles ni une collecte Bitbucket réelle.
 
 GitHub Actions exécute les trois contrôles sur Rust stable, sous Ubuntu, à chaque
 `push` et `pull_request`.

@@ -919,3 +919,51 @@ fn pending_review_comments_do_not_count_or_set_the_first_received_review() {
     assert!(activity.reviews_given.is_empty());
     assert!(activity.comments.is_empty());
 }
+
+#[test]
+fn common_source_collects_metrics_from_the_existing_bitbucket_adapter() {
+    use dev_metrics::metrics::{MetricsConfig, SourceRequest, collect};
+    let mut server = Server::new();
+    repository(
+        &mut server,
+        vec![pr(7, Some("{alice}"), "2026-10-24T00:00:00Z", "MERGED")],
+        vec![commit("abc123", Some("{alice}"), "2026-10-24T00:00:00Z")],
+    );
+    pr_history(
+        &mut server,
+        7,
+        vec![
+            approval(Some("{bob}"), "2026-10-24T12:00:00Z"),
+            json!({"update":{"state":"MERGED","date":"2026-10-25T00:00:00Z"}}),
+        ],
+        vec![comment(12, Some("{alice}"), "2026-10-24T13:00:00Z", true)],
+        vec![
+            diff(Some("src/lib.rs"), None, 10, 2),
+            diff(Some("Cargo.lock"), None, 1000, 0),
+        ],
+    );
+    endpoint(
+        &mut server,
+        "/2.0/repositories/team/project/diffstat/abc123",
+        json!({"values":[diff(Some("src/lib.rs"), None, 10, 2), diff(Some("Cargo.lock"), None, 1000, 0)]}),
+    );
+    let source = source(&server);
+    let report = collect(
+        &[SourceRequest {
+            source: &source,
+            user: None,
+        }],
+        chrono::NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
+        &MetricsConfig::default(),
+    )
+    .unwrap();
+    let week = &report.windows[0].metrics;
+    assert_eq!(week.lines_added.current, Some(10.0));
+    assert_eq!(week.lines_deleted.current, Some(2.0));
+    assert_eq!(week.median_pull_request_lines.current, Some(12.0));
+    assert_eq!(week.median_merge_seconds.current, Some(86_400.0));
+    assert_eq!(week.median_first_review_seconds.current, Some(43_200.0));
+    assert_eq!(week.reviews_received.current, Some(1.0));
+    assert_eq!(week.comments_left.current, Some(1.0));
+    assert_eq!(report.by_repository[0].source, Source::Bitbucket);
+}

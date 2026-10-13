@@ -4,8 +4,8 @@ mod model;
 pub use auth::{resolve_token, resolve_workspace};
 
 use crate::activity::{
-    Activity, Comment, CommentKind, Commit, FileChange, Period, PullRequest, Review, ReviewState,
-    Source,
+    Activity, ActivitySource, Comment, CommentKind, Commit, FileChange, Period, PullRequest,
+    Review, ReviewState, Source,
 };
 use chrono::{DateTime, Utc};
 use model::{
@@ -19,6 +19,16 @@ use std::error::Error;
 pub struct BitbucketSource {
     api: api::Api,
     workspace: String,
+}
+
+impl ActivitySource for BitbucketSource {
+    fn collect_activity(
+        &self,
+        user: Option<&str>,
+        period: Period,
+    ) -> Result<Activity, Box<dyn Error>> {
+        self.activity(user, period)
+    }
 }
 
 impl BitbucketSource {
