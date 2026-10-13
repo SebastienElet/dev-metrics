@@ -1,0 +1,24 @@
+name: dev-metrics CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Installer Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Vérifier le format
+        run: cargo fmt --check
+      - name: Vérifier Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Exécuter les tests
+        run: cargo test
