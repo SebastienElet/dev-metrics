@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -17,10 +17,27 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum Command {
+    #[command(about = "Collecter l'activité GitHub sur une période UTC")]
+    Github {
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        from: String,
+        #[arg(long, value_name = "YYYY-MM-DD")]
+        to: String,
+        #[arg(long, help = "Utilisateur GitHub (par défaut : compte authentifié)")]
+        user: Option<String>,
+        #[arg(long, value_enum, default_value = "json")]
+        format: Format,
+    },
     #[command(about = "Rapport de métriques (non implémenté)")]
     Report,
     #[command(about = "Planification des rapports (non implémentée)")]
     Schedule,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum Format {
+    Json,
+    Table,
 }
 
 #[cfg(test)]
@@ -30,6 +47,27 @@ mod tests {
     #[test]
     fn parses_schedule() {
         assert!(Cli::try_parse_from(["dev-metrics", "schedule"]).is_ok());
+    }
+
+    #[test]
+    fn parses_github_period_user_and_output_format() {
+        for format in ["json", "table"] {
+            assert!(
+                Cli::try_parse_from([
+                    "dev-metrics",
+                    "github",
+                    "--from",
+                    "2026-10-01",
+                    "--to",
+                    "2026-10-07",
+                    "--user",
+                    "octocat",
+                    "--format",
+                    format
+                ])
+                .is_ok()
+            );
+        }
     }
 
     #[test]

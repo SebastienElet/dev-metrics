@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source": "github",
+  "user": "octocat",
+  "period": {
+    "from": "2026-10-01",
+    "to": "2026-10-07"
+  },
+  "pull_requests": [],
+  "reviews_given": [],
+  "reviews_received": [],
+  "comments": [],
+  "commits": []
+}
