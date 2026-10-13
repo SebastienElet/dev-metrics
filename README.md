@@ -1,4 +1,4 @@
-# devmetrics
+# dev-metrics
 
 CLI Rust pour suivre ses métriques de dev (GitHub, Bitbucket) et générer une note Obsidian hebdomadaire.
 
@@ -15,14 +15,14 @@ puis, depuis la racine du dépôt :
 cargo install --path . --locked
 ```
 
-Le binaire `devmetrics` est installé dans le répertoire des binaires Cargo
+Le binaire `dev-metrics` est installé dans le répertoire des binaires Cargo
 (par défaut `~/.cargo/bin`), qui doit figurer dans le `PATH`.
 
 ## Configuration
 
 ```sh
-mkdir -p ~/.config/devmetrics
-cp config.example.toml ~/.config/devmetrics/config.toml
+mkdir -p ~/.config/dev-metrics
+cp config.example.toml ~/.config/dev-metrics/config.toml
 ```
 
 La configuration TOML contient un champ obligatoire :
@@ -35,7 +35,7 @@ output_dir = "./reports"
 affiché par les placeholders ; aucun répertoire n'est créé. Un chemin relatif
 est relatif au répertoire de travail, et `~` n'est pas développé dans cette valeur.
 
-Par défaut, le fichier est lu depuis `$HOME/.config/devmetrics/config.toml`,
+Par défaut, le fichier est lu depuis `$HOME/.config/dev-metrics/config.toml`,
 y compris sur macOS. `--config PATH` remplace ce chemin et peut précéder ou suivre
 la sous-commande. Un chemin relatif passé à `--config` est relatif au répertoire
 de travail. Si `HOME` est absent ou vide, `--config` est nécessaire.
@@ -47,12 +47,12 @@ nécessitent aucun fichier de configuration.
 ## Usage
 
 ```sh
-devmetrics --help
-devmetrics --version
-devmetrics report
-devmetrics schedule
-devmetrics --config config.example.toml report
-devmetrics schedule --config config.example.toml
+dev-metrics --help
+dev-metrics --version
+dev-metrics report
+dev-metrics schedule
+dev-metrics --config config.example.toml report
+dev-metrics schedule --config config.example.toml
 ```
 
 Sans installation :

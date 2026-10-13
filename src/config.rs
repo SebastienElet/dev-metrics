@@ -30,7 +30,7 @@ pub fn config_path(explicit: Option<PathBuf>, home: Option<OsString>) -> Result<
     let home = home
         .filter(|value| !value.is_empty())
         .ok_or("HOME absent ou vide ; indiquez un fichier avec --config")?;
-    Ok(PathBuf::from(home).join(".config/devmetrics/config.toml"))
+    Ok(PathBuf::from(home).join(".config/dev-metrics/config.toml"))
 }
 
 #[cfg(test)]
@@ -60,7 +60,7 @@ mod tests {
         let home = PathBuf::from("home");
         assert_eq!(
             config_path(None, Some(home.clone().into_os_string())).unwrap(),
-            home.join(".config/devmetrics/config.toml")
+            home.join(".config/dev-metrics/config.toml")
         );
     }
 

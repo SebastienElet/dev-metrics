@@ -15,13 +15,14 @@ fn help_works_without_home_or_config() {
         vec!["report", "--help"],
         vec!["schedule", "--help"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_devmetrics"))
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
             .args(arguments)
             .env_remove("HOME")
             .output()
             .unwrap();
         assert!(output.status.success(), "{}", stderr(&output));
         assert!(stdout(&output).contains("Usage:"));
+        assert!(stdout(&output).contains("Usage: dev-metrics"));
         assert!(stdout(&output).contains("--config"));
     }
 }
@@ -29,7 +30,7 @@ fn help_works_without_home_or_config() {
 #[test]
 fn placeholders_load_explicit_config_without_home() {
     for command in ["report", "schedule"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_devmetrics"))
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
             .args(["--config", "config.example.toml", command])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .env_remove("HOME")
@@ -44,10 +45,10 @@ fn placeholders_load_explicit_config_without_home() {
 #[test]
 fn loads_default_config_under_home() {
     let home = tempfile::tempdir().unwrap();
-    let directory = home.path().join(".config/devmetrics");
+    let directory = home.path().join(".config/dev-metrics");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("config.toml"), "output_dir = 'weekly-notes'").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_devmetrics"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
         .arg("report")
         .env("HOME", home.path())
         .output()
@@ -59,10 +60,10 @@ fn loads_default_config_under_home() {
 #[test]
 fn config_override_ignores_invalid_default_file() {
     let home = tempfile::tempdir().unwrap();
-    let directory = home.path().join(".config/devmetrics");
+    let directory = home.path().join(".config/dev-metrics");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("config.toml"), "invalid TOML").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_devmetrics"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
         .args(["report", "--config", "config.example.toml"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("HOME", home.path())
@@ -83,7 +84,7 @@ fn config_failures_return_nonzero_without_placeholder_output() {
         if let Some(content) = content {
             std::fs::write(&path, content).unwrap();
         }
-        let output = Command::new(env!("CARGO_BIN_EXE_devmetrics"))
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
             .arg("report")
             .arg("--config")
             .arg(&path)
@@ -97,7 +98,7 @@ fn config_failures_return_nonzero_without_placeholder_output() {
 
 #[test]
 fn missing_home_requires_explicit_config() {
-    let output = Command::new(env!("CARGO_BIN_EXE_devmetrics"))
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
         .arg("report")
         .env_remove("HOME")
         .output()

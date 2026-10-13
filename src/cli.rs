@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(name = "dev-metrics", version, about)]
 pub struct Cli {
     #[arg(
         long,
@@ -29,14 +29,14 @@ mod tests {
 
     #[test]
     fn parses_schedule() {
-        assert!(Cli::try_parse_from(["devmetrics", "schedule"]).is_ok());
+        assert!(Cli::try_parse_from(["dev-metrics", "schedule"]).is_ok());
     }
 
     #[test]
     fn parses_report_with_config_before_or_after_subcommand() {
         for arguments in [
-            ["devmetrics", "--config", "custom.toml", "report"],
-            ["devmetrics", "report", "--config", "custom.toml"],
+            ["dev-metrics", "--config", "custom.toml", "report"],
+            ["dev-metrics", "report", "--config", "custom.toml"],
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
             assert_eq!(cli.command, Command::Report);
@@ -47,9 +47,9 @@ mod tests {
     #[test]
     fn rejects_missing_or_unknown_subcommand_and_config_without_path() {
         for arguments in [
-            vec!["devmetrics"],
-            vec!["devmetrics", "unknown"],
-            vec!["devmetrics", "report", "--config"],
+            vec!["dev-metrics"],
+            vec!["dev-metrics", "unknown"],
+            vec!["dev-metrics", "report", "--config"],
         ] {
             assert!(Cli::try_parse_from(arguments).is_err());
         }

@@ -1,7 +1,8 @@
 [package]
-name = "devmetrics"
+name = "dev-metrics"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/SebastienElet/dev-metrics"
 description = "CLI pour suivre ses métriques de développement"
 
 [dependencies]
