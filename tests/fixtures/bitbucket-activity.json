@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "source": "bitbucket",
+  "user": "{alice}",
+  "period": {
+    "from": "2026-10-01",
+    "to": "2026-10-07"
+  },
+  "pull_requests": [
+    {
+      "source": "bitbucket",
+      "repository": "team/project",
+      "number": 7,
+      "author": "{alice}",
+      "title": "PR 7",
+      "url": "https://bitbucket.org/team/project/pull-requests/7",
+      "created_at": "2026-10-01T00:00:00Z",
+      "merged_at": null,
+      "first_review_received_at": "2026-10-02T00:00:00Z",
+      "additions": 8,
+      "deletions": 2,
+      "files": [
+        {
+          "path": "src/lib.rs",
+          "previous_path": null,
+          "additions": 8,
+          "deletions": 2
+        }
+      ]
+    }
+  ],
+  "reviews_given": [],
+  "reviews_received": [
+    {
+      "source": "bitbucket",
+      "repository": "team/project",
+      "pull_request_number": 7,
+      "id": 1,
+      "author": "{bob}",
+      "submitted_at": "2026-10-02T00:00:00Z",
+      "state": "APPROVED",
+      "url": "https://bitbucket.org/team/project/pull-requests/7"
+    }
+  ],
+  "comments": [
+    {
+      "source": "bitbucket",
+      "repository": "team/project",
+      "issue_number": 7,
+      "id": 11,
+      "author": "{alice}",
+      "created_at": "2026-10-04T00:00:00Z",
+      "url": "https://bitbucket.org/team/project/pull-requests/7#comment-11",
+      "kind": "review"
+    }
+  ],
+  "commits": [
+    {
+      "source": "bitbucket",
+      "repository": "team/project",
+      "sha": "abc123",
+      "message": "Improve metrics",
+      "url": "https://bitbucket.org/team/project/commits/abc123",
+      "authored_at": "2026-10-03T00:00:00Z",
+      "additions": 8,
+      "deletions": 2,
+      "files": [
+        {
+          "path": "src/lib.rs",
+          "previous_path": null,
+          "additions": 8,
+          "deletions": 2
+        }
+      ]
+    }
+  ]
+}

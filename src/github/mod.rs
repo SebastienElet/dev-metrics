@@ -1,13 +1,11 @@
 mod api;
 mod auth;
-mod model;
-mod output;
 
+pub use crate::activity::*;
 use api::{
     Api, CommentDetail, CommitDetail, CommitReference, Issue, PullRequestDetail, ReviewDetail,
 };
 pub use auth::resolve_token;
-pub use model::*;
 use reqwest::Url;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -35,7 +33,7 @@ impl GitHubSource {
         {
             return Err("Utilisateur GitHub invalide".into());
         }
-        let mut activity = Activity::empty(user, period);
+        let mut activity = Activity::empty(Source::GitHub, user, period);
         let mut candidates = BTreeMap::new();
         for query in [
             format!("is:pr author:{user} updated:>={}", activity.period.from),

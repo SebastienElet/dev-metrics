@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 pub struct Config {
     pub output_dir: PathBuf,
     pub github: Option<GitHubConfig>,
+    pub bitbucket: Option<BitbucketConfig>,
 }
 
 #[derive(Deserialize, PartialEq)]
@@ -20,6 +21,23 @@ impl std::fmt::Debug for GitHubConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GitHubConfig")
+            .field("token", &self.token.as_ref().map(|_| "[masqué]"))
+            .finish()
+    }
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BitbucketConfig {
+    pub workspace: Option<String>,
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for BitbucketConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BitbucketConfig")
+            .field("workspace", &self.workspace)
             .field("token", &self.token.as_ref().map(|_| "[masqué]"))
             .finish()
     }
@@ -75,6 +93,17 @@ mod tests {
         assert!(
             Config::parse("output_dir = './reports'\n[github]\ntoken = 'configured-token'").is_ok()
         );
+    }
+
+    #[test]
+    fn accepts_optional_bitbucket_workspace_and_masks_token() {
+        let config = Config::parse(
+            "output_dir = './reports'\n[bitbucket]\nworkspace = 'team'\ntoken = 'secret-token'",
+        )
+        .unwrap();
+        assert!(!format!("{config:?}").contains("secret-token"));
+        assert!(Config::parse("output_dir = './reports'\n[bitbucket]").is_ok());
+        assert!(Config::parse("output_dir = './reports'\n[bitbucket]\nunknown = true").is_err());
     }
 
     #[test]

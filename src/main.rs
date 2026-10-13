@@ -47,6 +47,37 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             writeln!(std::io::stdout().lock(), "{output}")?;
             return Ok(());
         }
+        Command::Bitbucket {
+            from,
+            to,
+            workspace,
+            user,
+            format,
+        } => {
+            let period = Period::parse(&from, &to)?;
+            let configured = config.bitbucket.as_ref();
+            let workspace = dev_metrics::bitbucket::resolve_workspace(
+                workspace.as_deref(),
+                configured.and_then(|c| c.workspace.as_deref()),
+            )?;
+            let token = dev_metrics::bitbucket::resolve_token(
+                std::env::var_os("BITBUCKET_TOKEN"),
+                configured.and_then(|c| c.token.as_deref()),
+            )?;
+            let source = dev_metrics::bitbucket::BitbucketSource::new(
+                "https://api.bitbucket.org/2.0/".parse()?,
+                &token,
+                workspace,
+            )?;
+            let activity = source.activity(user.as_deref(), period)?;
+            let output = match format {
+                Format::Json => serde_json::to_string_pretty(&activity)?,
+                Format::Table => activity.table(),
+            };
+            use std::io::Write;
+            writeln!(std::io::stdout().lock(), "{output}")?;
+            return Ok(());
+        }
         Command::Report => "report",
         Command::Schedule => "schedule",
     };

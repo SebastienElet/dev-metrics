@@ -641,13 +641,46 @@ fn resolves_the_authenticated_user_from_the_api() {
 fn assert_schema(activity: &dev_metrics::github::Activity) {
     let schema: Value =
         serde_json::from_str(include_str!("../schemas/github-activity-v1.schema.json")).unwrap();
+    let common: Value =
+        serde_json::from_str(include_str!("../schemas/activity-v1.schema.json")).unwrap();
+    let registry = jsonschema::Registry::new().add("https://github.com/SebastienElet/dev-metrics/blob/main/schemas/activity-v1.schema.json", common).unwrap().prepare().unwrap();
     let validator = jsonschema::draft202012::options()
         .should_validate_formats(true)
+        .with_registry(&registry)
         .build(&schema)
         .unwrap();
-    validator
-        .validate(&serde_json::to_value(activity).unwrap())
-        .unwrap();
+    let value = serde_json::to_value(activity).unwrap();
+    validator.validate(&value).unwrap();
+    let mut invalid = value.clone();
+    invalid["source"] = json!("bitbucket");
+    assert!(!validator.is_valid(&invalid));
+    for field in [
+        "pull_requests",
+        "reviews_given",
+        "reviews_received",
+        "comments",
+        "commits",
+    ] {
+        if value[field]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            let mut invalid = value.clone();
+            invalid[field][0]["repository"] = json!("bad_owner/project");
+            assert!(
+                !validator.is_valid(&invalid),
+                "accepted invalid GitHub owner in {field}"
+            );
+        }
+    }
+    if !activity.pull_requests.is_empty() {
+        let mut invalid = value.clone();
+        invalid["pull_requests"][0]["source"] = json!("bitbucket");
+        assert!(!validator.is_valid(&invalid));
+        let mut invalid = value;
+        invalid["pull_requests"][0]["files"] = json!(null);
+        assert!(!validator.is_valid(&invalid));
+    }
 }
 
 #[test]

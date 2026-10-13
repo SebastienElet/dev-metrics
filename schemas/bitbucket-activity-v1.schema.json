@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SebastienElet/dev-metrics/blob/main/schemas/bitbucket-activity-v1.schema.json",
+  "title": "Activit\u00e9 bitbucket brute v1",
+  "allOf": [
+    {
+      "$ref": "https://github.com/SebastienElet/dev-metrics/blob/main/schemas/activity-v1.schema.json"
+    }
+  ],
+  "properties": {
+    "source": {
+      "const": "bitbucket"
+    },
+    "pull_requests": {
+      "items": {
+        "properties": {
+          "source": {
+            "const": "bitbucket"
+          }
+        }
+      }
+    },
+    "reviews_given": {
+      "items": {
+        "properties": {
+          "source": {
+            "const": "bitbucket"
+          }
+        }
+      }
+    },
+    "reviews_received": {
+      "items": {
+        "properties": {
+          "source": {
+            "const": "bitbucket"
+          }
+        }
+      }
+    },
+    "comments": {
+      "items": {
+        "properties": {
+          "source": {
+            "const": "bitbucket"
+          }
+        }
+      }
+    },
+    "commits": {
+      "items": {
+        "properties": {
+          "source": {
+            "const": "bitbucket"
+          }
+        }
+      }
+    }
+  }
+}
