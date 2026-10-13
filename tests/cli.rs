@@ -14,6 +14,7 @@ fn help_works_without_home_or_config() {
         vec!["--help"],
         vec!["report", "--help"],
         vec!["schedule", "--help"],
+        vec!["github", "--help"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
             .args(arguments)
@@ -25,6 +26,34 @@ fn help_works_without_home_or_config() {
         assert!(stdout(&output).contains("Usage: dev-metrics"));
         assert!(stdout(&output).contains("--config"));
     }
+}
+
+#[test]
+fn github_requires_credentials_without_gh_or_configured_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+        .args([
+            "github",
+            "--from",
+            "2026-10-01",
+            "--to",
+            "2026-10-07",
+            "--user",
+            "octocat",
+            "--config",
+            "config.example.toml",
+        ])
+        .env("PATH", directory.path())
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(
+        stderr(&output).contains("Authentification GitHub absente"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 #[test]
@@ -105,4 +134,37 @@ fn missing_home_requires_explicit_config() {
         .unwrap();
     assert!(!output.status.success());
     assert!(stderr(&output).contains("--config"));
+}
+
+#[test]
+fn github_rejects_missing_dates_invalid_periods_and_unknown_formats() {
+    for arguments in [
+        vec!["github"],
+        vec![
+            "github",
+            "--from",
+            "2026-10-07",
+            "--to",
+            "2026-10-01",
+            "--config",
+            "config.example.toml",
+        ],
+        vec![
+            "github",
+            "--from",
+            "2026-10-01",
+            "--to",
+            "2026-10-07",
+            "--format",
+            "yaml",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+            .args(arguments)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(stdout(&output).is_empty());
+    }
 }

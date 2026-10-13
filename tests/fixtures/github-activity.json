@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "source": "github",
+  "user": "octocat",
+  "period": {
+    "from": "2026-10-01",
+    "to": "2026-10-07"
+  },
+  "pull_requests": [
+    {
+      "source": "github",
+      "repository": "octocat/project",
+      "number": 7,
+      "author": "octocat",
+      "title": "PR 7",
+      "url": "https://github.com/octocat/project/pull/7",
+      "created_at": "2026-10-01T00:00:00Z",
+      "merged_at": "2026-10-02T00:00:00Z",
+      "first_review_received_at": "2026-10-01T12:00:00Z",
+      "additions": 10,
+      "deletions": 2,
+      "files": [
+        {
+          "path": "src/main.rs",
+          "previous_path": null,
+          "additions": 10,
+          "deletions": 2
+        }
+      ]
+    }
+  ],
+  "reviews_given": [],
+  "reviews_received": [
+    {
+      "source": "github",
+      "repository": "octocat/project",
+      "pull_request_number": 7,
+      "id": 80,
+      "author": "alice",
+      "submitted_at": "2026-10-01T12:00:00Z",
+      "state": "APPROVED",
+      "url": "https://github.com/octocat/project/pull/7#pullrequestreview-80"
+    }
+  ],
+  "comments": [
+    {
+      "source": "github",
+      "repository": "octocat/project",
+      "issue_number": 7,
+      "id": 90,
+      "author": "octocat",
+      "created_at": "2026-10-01T13:00:00Z",
+      "url": "https://github.com/octocat/project/pull/7#issuecomment-90",
+      "kind": "discussion"
+    }
+  ],
+  "commits": []
+}

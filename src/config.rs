@@ -7,15 +7,30 @@ use std::path::{Path, PathBuf};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub output_dir: PathBuf,
+    pub github: Option<GitHubConfig>,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GitHubConfig {
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for GitHubConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GitHubConfig")
+            .field("token", &self.token.as_ref().map(|_| "[masqué]"))
+            .finish()
+    }
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self, Box<dyn Error>> {
         let source = std::fs::read_to_string(path)
             .map_err(|error| format!("Impossible de lire {} : {error}", path.display()))?;
-        Self::parse(&source).map_err(|error| {
-            format!("Configuration invalide dans {} : {error}", path.display()).into()
-        })
+        Self::parse(&source)
+            .map_err(|_| format!("Configuration invalide dans {}", path.display()).into())
     }
 
     pub fn parse(source: &str) -> Result<Self, toml::de::Error> {
@@ -53,6 +68,13 @@ mod tests {
         ] {
             assert!(Config::parse(source).is_err(), "accepted {source:?}");
         }
+    }
+
+    #[test]
+    fn accepts_optional_github_token() {
+        assert!(
+            Config::parse("output_dir = './reports'\n[github]\ntoken = 'configured-token'").is_ok()
+        );
     }
 
     #[test]
