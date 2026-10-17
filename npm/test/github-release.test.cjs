@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
@@ -27,12 +28,18 @@ if (command === 'view') {
   for (const file of files) fs.copyFileSync(path.join(assets, file), path.join(destination, file));
 } else if (command === 'upload') {
   const failOnce = process.env.TEST_FAIL_UPLOAD_ONCE;
-  if (failOnce && fs.existsSync(failOnce)) {
-    fs.unlinkSync(failOnce);
-    process.exit(1);
+  for (const file of args.slice(3, args.indexOf('--repo'))) {
+    const destination = path.join(assets, path.basename(file));
+    if (fs.existsSync(destination) && !args.includes('--clobber')) process.exit(1);
+    fs.copyFileSync(file, destination);
+    if (process.env.TEST_CORRUPT_UPLOAD && file.endsWith('.tar.gz')) {
+      fs.writeFileSync(destination, 'corrupt');
+    }
+    if (failOnce && fs.existsSync(failOnce)) {
+      fs.unlinkSync(failOnce);
+      process.exit(1);
+    }
   }
-  const file = args[3];
-  fs.copyFileSync(file, path.join(assets, path.basename(file)));
 } else if (command === 'edit') {
   fs.writeFileSync(statePath, JSON.stringify({ isDraft: false }));
 } else if (command === 'create') {
@@ -55,7 +62,8 @@ function fixture(existingAssets = []) {
   mkdirSync(bin);
   writeFileSync(path.join(root, 'release/state.json'), JSON.stringify({ isDraft: true }));
   writeFileSync(path.join(dist, 'binary.tar.gz'), 'archive');
-  writeFileSync(path.join(dist, 'binary.tar.gz.sha256'), 'checksum');
+  const checksum = createHash('sha256').update('archive').digest('hex');
+  writeFileSync(path.join(dist, 'binary.tar.gz.sha256'), `${checksum}  binary.tar.gz\n`);
   for (const file of existingAssets) writeFileSync(path.join(assets, file), readFileSync(path.join(dist, file)));
   const gh = path.join(bin, 'gh');
   writeFileSync(gh, fakeGh);
@@ -72,12 +80,15 @@ function run({ root, dist, bin }, extraEnv = {}) {
   });
 }
 
-test('resumes a matching partial draft and publishes it', () => {
+test('replaces a partial draft with assets from the current build', () => {
   const context = fixture(['binary.tar.gz']);
   try {
+    writeFileSync(path.join(context.dist, 'binary.tar.gz'), 'rebuilt archive');
+    writeFileSync(path.join(context.dist, 'binary.tar.gz.sha256'), 'rebuilt checksum');
     const result = run(context);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(JSON.parse(readFileSync(path.join(context.root, 'release/state.json'))), { isDraft: false });
+    assert.deepEqual(readFileSync(path.join(context.assets, 'binary.tar.gz')), readFileSync(path.join(context.dist, 'binary.tar.gz')));
     assert.deepEqual(readFileSync(path.join(context.assets, 'binary.tar.gz.sha256')), readFileSync(path.join(context.dist, 'binary.tar.gz.sha256')));
   } finally {
     rmSync(context.root, { recursive: true, force: true });
@@ -92,10 +103,25 @@ test('a failed draft upload can be resumed on the next run', () => {
     assert.notEqual(run(context, { TEST_FAIL_UPLOAD_ONCE: failOnce }).status, 0);
     assert.equal(existsSync(failOnce), false);
     assert.deepEqual(JSON.parse(readFileSync(path.join(context.root, 'release/state.json'))), { isDraft: true });
+    assert.equal(existsSync(path.join(context.assets, 'binary.tar.gz')), true);
     const resumed = run(context);
     assert.equal(resumed.status, 0, resumed.stderr);
     assert.deepEqual(JSON.parse(readFileSync(path.join(context.root, 'release/state.json'))), { isDraft: false });
     assert.deepEqual(readFileSync(path.join(context.assets, 'binary.tar.gz')), readFileSync(path.join(context.dist, 'binary.tar.gz')));
+  } finally {
+    rmSync(context.root, { recursive: true, force: true });
+  }
+});
+
+test('does not publish a draft after a successful but corrupt upload', () => {
+  const context = fixture(['binary.tar.gz']);
+  try {
+    const result = run(context, { TEST_CORRUPT_UPLOAD: '1' });
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(JSON.parse(readFileSync(path.join(context.root, 'release/state.json'))), { isDraft: true });
+    const retry = run(context);
+    assert.equal(retry.status, 0, retry.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(path.join(context.root, 'release/state.json'))), { isDraft: false });
   } finally {
     rmSync(context.root, { recursive: true, force: true });
   }
@@ -114,13 +140,42 @@ test('creates a new release with every expected asset', () => {
   }
 });
 
-test('refuses a draft containing different bytes', () => {
+test('refuses a draft containing an unexpected asset', () => {
   const context = fixture(['binary.tar.gz']);
-  writeFileSync(path.join(context.assets, 'binary.tar.gz'), 'other');
+  writeFileSync(path.join(context.assets, 'unexpected.zip'), 'other');
   try {
     const result = run(context);
     assert.notEqual(result.status, 0);
     assert.deepEqual(JSON.parse(readFileSync(path.join(context.root, 'release/state.json'))), { isDraft: true });
+  } finally {
+    rmSync(context.root, { recursive: true, force: true });
+  }
+});
+
+test('uses verified published assets on a rerun with a different build', () => {
+  const context = fixture(['binary.tar.gz', 'binary.tar.gz.sha256']);
+  writeFileSync(path.join(context.root, 'release/state.json'), JSON.stringify({ isDraft: false }));
+  writeFileSync(path.join(context.dist, 'binary.tar.gz'), 'rebuilt archive');
+  writeFileSync(path.join(context.dist, 'binary.tar.gz.sha256'), 'rebuilt checksum');
+  try {
+    const result = run(context);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(readFileSync(path.join(context.dist, 'binary.tar.gz'), 'utf8'), 'archive');
+    const checksum = createHash('sha256').update('archive').digest('hex');
+    assert.equal(readFileSync(path.join(context.dist, 'binary.tar.gz.sha256'), 'utf8'), `${checksum}  binary.tar.gz\n`);
+  } finally {
+    rmSync(context.root, { recursive: true, force: true });
+  }
+});
+
+test('refuses published assets with a failing checksum', () => {
+  const context = fixture(['binary.tar.gz', 'binary.tar.gz.sha256']);
+  writeFileSync(path.join(context.root, 'release/state.json'), JSON.stringify({ isDraft: false }));
+  writeFileSync(path.join(context.assets, 'binary.tar.gz'), 'tampered');
+  try {
+    const result = run(context);
+    assert.notEqual(result.status, 0);
+    assert.equal(readFileSync(path.join(context.dist, 'binary.tar.gz'), 'utf8'), 'archive');
   } finally {
     rmSync(context.root, { recursive: true, force: true });
   }

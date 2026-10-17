@@ -14,15 +14,20 @@ if gh release view "$release_tag" --repo "$repository" >/dev/null; then
     gh release download "$release_tag" --repo "$repository" --dir existing
   fi
   release_state=$(gh release view "$release_tag" --repo "$repository" --json isDraft --jq .isDraft)
-  bash "$asset_check" "$dist_directory" existing "$release_state" > missing-assets.txt
   if [[ "$release_state" == true ]]; then
-    while IFS= read -r missing_asset; do
-      gh release upload "$release_tag" "$missing_asset" --repo "$repository"
-    done < missing-assets.txt
+    bash "$asset_check" "$dist_directory" existing draft
+    gh release upload "$release_tag" "$dist_directory"/* --repo "$repository" --clobber
     mkdir complete
     gh release download "$release_tag" --repo "$repository" --dir complete
-    bash "$asset_check" "$dist_directory" complete false
+    bash "$asset_check" "$dist_directory" complete complete
     gh release edit "$release_tag" --repo "$repository" --draft=false
+  elif [[ "$release_state" == false ]]; then
+    bash "$asset_check" "$dist_directory" existing published
+    (cd existing && sha256sum --check --strict ./*.sha256)
+    cp existing/* "$dist_directory"/
+  else
+    printf 'Unknown release state: %s\n' "$release_state" >&2
+    exit 1
   fi
 else
   gh release create "$release_tag" "$dist_directory"/* --repo "$repository" --verify-tag --title "$release_tag" --generate-notes

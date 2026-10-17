@@ -20,8 +20,8 @@ function fixture() {
   return { root, expected, actual };
 }
 
-function run(expected, actual, state = 'false') {
-  return spawnSync('bash', [check, expected, actual, state], { encoding: 'utf8' });
+function run(expected, actual, mode = 'complete') {
+  return spawnSync('bash', [check, expected, actual, mode], { encoding: 'utf8' });
 }
 
 test('accepts identical archives and checksums', () => {
@@ -78,44 +78,52 @@ test('rejects hidden assets and an unverified release state', () => {
   }
 });
 
-test('a matching draft lists only missing assets for upload', () => {
+test('a partial draft may omit assets', () => {
   const { root, expected, actual } = fixture();
   const missing = path.join(actual, 'dev-metrics.tar.gz.sha256');
   try {
     unlinkSync(missing);
-    const result = run(expected, actual, 'true');
+    const result = run(expected, actual, 'draft');
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), path.join(expected, 'dev-metrics.tar.gz.sha256'));
-    assert.notEqual(run(expected, actual, 'false').status, 0);
+    assert.notEqual(run(expected, actual, 'complete').status, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('an empty draft lists every required asset', () => {
+test('an empty draft can be replaced', () => {
   const { root, expected } = fixture();
   const empty = path.join(root, 'empty');
   mkdirSync(empty);
   try {
-    const result = run(expected, empty, 'true');
+    const result = run(expected, empty, 'draft');
     assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(result.stdout.trim().split('\n').sort(), [
-      path.join(expected, 'dev-metrics.tar.gz'),
-      path.join(expected, 'dev-metrics.tar.gz.sha256'),
-    ]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-test('a draft rejects changed and unexpected assets', () => {
+test('a draft permits rebuilt bytes but rejects unexpected assets', () => {
   const { root, expected, actual } = fixture();
   try {
     writeFileSync(path.join(actual, 'dev-metrics.tar.gz'), 'other');
-    assert.notEqual(run(expected, actual, 'true').status, 0);
-    writeFileSync(path.join(actual, 'dev-metrics.tar.gz'), 'archive');
+    assert.equal(run(expected, actual, 'draft').status, 0);
     writeFileSync(path.join(actual, 'unexpected.zip'), 'extra');
-    assert.notEqual(run(expected, actual, 'true').status, 0);
+    assert.notEqual(run(expected, actual, 'draft').status, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a published release requires the expected names but permits rebuilt bytes', () => {
+  const { root, expected, actual } = fixture();
+  try {
+    writeFileSync(path.join(actual, 'dev-metrics.tar.gz'), 'other');
+    assert.equal(run(expected, actual, 'published').status, 0);
+    unlinkSync(path.join(actual, 'dev-metrics.tar.gz.sha256'));
+    assert.notEqual(run(expected, actual, 'published').status, 0);
+    writeFileSync(path.join(actual, 'unexpected.zip'), 'extra');
+    assert.notEqual(run(expected, actual, 'published').status, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
