@@ -5,8 +5,14 @@ use serde_json::{Value, json};
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 
-const KEYS: [&str; 6] = [
+pub mod check;
+
+pub const GITHUB_TOKEN_HELP: &str = "GitHub : fine-grained PAT en lecture seule : Metadata (inclus), Contents, Pull requests.\nCréer : https://github.com/settings/personal-access-tokens/new\nAlternative classic : repo (privé) ou public_repo (public), read:org si organisations.\n";
+pub const BITBUCKET_TOKEN_HELP: &str = "Bitbucket Cloud : API token avec read:user:bitbucket, read:workspace:bitbucket, read:repository:bitbucket et read:pullrequest:bitbucket.\nCréer : https://id.atlassian.com/manage-profile/security/api-tokens\nbitbucket.email : email Atlassian pour l'authentification Basic ; facultatif avec Bearer.\nbitbucket.username : identifiant du compte dont les PR sont suivies, jamais l'email d'authentification.\n";
+
+const KEYS: [&str; 7] = [
     "github.token",
+    "bitbucket.email",
     "bitbucket.username",
     "bitbucket.token",
     "bitbucket.workspace",
@@ -26,9 +32,20 @@ pub enum ConfigFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+pub enum CheckFormat {
+    Table,
+    Json,
+}
+
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum ConfigAction {
-    #[command(about = "Créer le fichier de configuration")]
+    #[command(about = "Vérifier les droits des tokens configurés auprès des API")]
+    Check {
+        #[arg(long, value_enum, default_value = "table")]
+        format: CheckFormat,
+    },
+    #[command(about = "Créer le fichier de configuration", after_help = format!("{GITHUB_TOKEN_HELP}{BITBUCKET_TOKEN_HELP}"))]
     Init {
         #[arg(
             long,
@@ -39,7 +56,15 @@ pub enum ConfigAction {
         force: bool,
         #[arg(long)]
         github_token: Option<String>,
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Email Atlassian pour l'authentification Basic ; facultatif avec Bearer"
+        )]
+        bitbucket_email: Option<String>,
+        #[arg(
+            long,
+            help = "Compte Bitbucket suivi (slug, Account ID ou UUID) ; un email est enregistré dans bitbucket.email"
+        )]
         bitbucket_username: Option<String>,
         #[arg(long)]
         bitbucket_token: Option<String>,
@@ -80,8 +105,50 @@ fn config_error(message: impl ToString) -> CommandError {
     CommandError::new(ErrorCode::ConfigurationError, message)
 }
 
+fn setting_hint(key: &str) -> (&'static str, &'static str) {
+    match key {
+        "github.token" | "bitbucket.token" => ("token non vide sans espace", "fake-token"),
+        "bitbucket.email" => ("email Atlassian", "prenom.nom@domaine.com"),
+        "bitbucket.username" => (
+            "slug, Account ID ou UUID Bitbucket ; utilisez bitbucket.email pour l'authentification",
+            "alice",
+        ),
+        "bitbucket.workspace" => (
+            "slug de workspace sans espace ni barre oblique",
+            "mon-equipe",
+        ),
+        "metrics.excluded_files" => (
+            "motifs non vides séparés par des virgules",
+            "*.snap,generated/*",
+        ),
+        "output_dir" => ("chemin non vide", "./reports"),
+        _ => ("clé connue et valeur valide", "bitbucket.email"),
+    }
+}
+
+fn setting_error(key: &str) -> CommandError {
+    let (expected, example) = setting_hint(key);
+    let mut error = config_error(format!(
+        "Valeur invalide pour {key} : attendu {expected} (exemple : {example})"
+    ));
+    error.details = json!({ "key": key, "expected": expected, "example": example });
+    error
+}
+
+fn validate_cli_setting(key: &str, value: &str) -> Result<(), CommandError> {
+    validate_setting(key, value).map_err(|_| setting_error(key))
+}
+
+fn report_interactive_error(error: &CommandError) -> Result<(), CommandError> {
+    let message = serde_json::to_string(error)
+        .map_err(|_| config_error("Impossible d'afficher l'erreur de saisie"))?;
+    writeln!(io::stderr().lock(), "{message}")
+        .map_err(|_| config_error("Impossible d'afficher l'erreur de saisie"))
+}
+
 pub fn run(action: ConfigAction, path: &Path) -> Result<String, CommandError> {
     match action {
+        ConfigAction::Check { .. } => unreachable!(),
         ConfigAction::Path { format } => match format {
             ConfigFormat::Text => Ok(path.display().to_string()),
             ConfigFormat::Json => Ok(json!({ "path": path.display().to_string() }).to_string()),
@@ -90,6 +157,7 @@ pub fn run(action: ConfigAction, path: &Path) -> Result<String, CommandError> {
             non_interactive,
             force,
             github_token,
+            bitbucket_email,
             bitbucket_username,
             bitbucket_token,
             bitbucket_workspace,
@@ -110,17 +178,55 @@ pub fn run(action: ConfigAction, path: &Path) -> Result<String, CommandError> {
             };
             let mut values = [
                 github_token,
+                bitbucket_email,
                 bitbucket_username,
                 bitbucket_token,
                 bitbucket_workspace,
                 metrics_excluded_files,
                 output_dir,
             ];
-            if !non_interactive {
-                for (key, value) in KEYS.iter().zip(&mut values) {
-                    if value.is_none() {
-                        *value = prompt(key)?;
+            for index in 0..KEYS.len() {
+                let key = KEYS[index];
+                loop {
+                    let candidate = if values[index].is_some() || non_interactive {
+                        values[index].take()
+                    } else {
+                        prompt(key)?
+                    };
+                    if key == "bitbucket.username"
+                        && candidate
+                            .as_deref()
+                            .is_some_and(|value| value.contains('@'))
+                        && values[1].is_none()
+                    {
+                        let email = candidate.as_deref().unwrap();
+                        if let Err(error) = validate_cli_setting("bitbucket.email", email) {
+                            if non_interactive {
+                                return Err(error);
+                            }
+                            report_interactive_error(&error)?;
+                            continue;
+                        }
+                        values[1] = candidate;
+                        if non_interactive {
+                            break;
+                        }
+                        show_prompt(
+                            "Email enregistré dans bitbucket.email ; indiquez le compte à suivre ou laissez vide pour le compte authentifié.\n",
+                        )?;
+                        continue;
                     }
+                    if let Some(ref candidate) = candidate
+                        && let Err(error) = validate_cli_setting(key, candidate)
+                    {
+                        if non_interactive {
+                            return Err(error);
+                        }
+                        report_interactive_error(&error)?;
+                        continue;
+                    }
+                    values[index] = candidate;
+                    break;
                 }
             }
             let mut table = toml::Table::new();
@@ -133,7 +239,7 @@ pub fn run(action: ConfigAction, path: &Path) -> Result<String, CommandError> {
             Ok(path.display().to_string())
         }
         ConfigAction::Set { key, value } => {
-            validate_setting(&key, &value).map_err(config_error)?;
+            validate_cli_setting(&key, &value)?;
             let mut table = read(path)?;
             set_value(&mut table, &key, &value)?;
             save(path, &table, SaveMode::Replace)?;
@@ -218,7 +324,7 @@ fn entry(table: &toml::Table, key: &str, show_secrets: bool) -> Result<Value, Co
     };
     let value = match environment {
         Some(value) => {
-            validate_setting(key, &value).map_err(config_error)?;
+            validate_cli_setting(key, &value)?;
             Some(setting_value(key, &value))
         }
         None => {
@@ -234,7 +340,7 @@ fn entry(table: &toml::Table, key: &str, show_secrets: bool) -> Result<Value, Co
                 } else {
                     value.as_str().unwrap().to_owned()
                 };
-                validate_setting(key, &text).map_err(config_error)?;
+                validate_cli_setting(key, &text)?;
             }
             file_value.cloned()
         }
@@ -283,7 +389,7 @@ fn setting_value(key: &str, value: &str) -> toml::Value {
 }
 
 fn set_value(table: &mut toml::Table, key: &str, value: &str) -> Result<(), CommandError> {
-    validate_setting(key, value).map_err(config_error)?;
+    validate_cli_setting(key, value)?;
     if let Some((section, field)) = key.split_once('.') {
         let section = table
             .entry(section)
@@ -361,6 +467,11 @@ fn save(path: &Path, table: &toml::Table, mode: SaveMode) -> Result<(), CommandE
 }
 
 fn prompt(key: &str) -> Result<Option<String>, CommandError> {
+    match key {
+        "github.token" => show_prompt(GITHUB_TOKEN_HELP)?,
+        "bitbucket.token" => show_prompt(BITBUCKET_TOKEN_HELP)?,
+        _ => {}
+    }
     #[cfg(unix)]
     if key.ends_with(".token") && io::stdin().is_terminal() {
         let echo = TerminalEcho::hide()

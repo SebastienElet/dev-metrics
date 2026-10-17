@@ -23,12 +23,25 @@ token = "votre-token-github"
 
 [bitbucket]
 token = "votre-token-bitbucket"
+email = "prenom.nom@domaine.com"
 workspace = "votre-workspace"
 ```
 
 Si `gh` est connecté à GitHub, `[github].token` est facultatif. Pour Bitbucket,
 `BITBUCKET_TOKEN` peut remplacer le token du fichier. `--workspace` remplace le
 workspace configuré pour une commande. Ne commitez pas vos tokens.
+
+## Tokens
+
+**GitHub** — [Créer un fine-grained PAT](https://github.com/settings/personal-access-tokens/new) limité aux dépôts concernés.
+Permissions en lecture : Metadata (incluse), Contents et Pull requests.
+Alternative classic : `repo` pour les dépôts privés ou `public_repo` pour les publics ; `read:org` si vos organisations le demandent.
+
+**Bitbucket Cloud** — [Créer un API token](https://id.atlassian.com/manage-profile/security/api-tokens) avec scopes.
+Permissions en lecture : `read:user:bitbucket`, `read:workspace:bitbucket`, `read:repository:bitbucket`, `read:pullrequest:bitbucket`.
+`bitbucket.email` est l'email Atlassian pour l'authentification Basic ; sans lui, le token utilise Bearer. `config init --bitbucket-username EMAIL` remplit aussi cette clé.
+`bitbucket.username` désigne le compte dont les PR sont suivies (slug, Account ID ou UUID), pas l'email d'authentification.
+Vérifiez les accès avec `dev-metrics config check` (ou `--format json`) ; la commande sonde un dépôt accessible par source.
 
 ## Exemples
 

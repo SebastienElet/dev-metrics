@@ -7,6 +7,7 @@ fn command(path: &Path) -> Command {
     for name in [
         "DEV_METRICS_GITHUB_TOKEN",
         "DEV_METRICS_BITBUCKET_USERNAME",
+        "DEV_METRICS_BITBUCKET_EMAIL",
         "DEV_METRICS_BITBUCKET_TOKEN",
         "DEV_METRICS_BITBUCKET_WORKSPACE",
         "BITBUCKET_TOKEN",
@@ -133,11 +134,12 @@ fn set_get_unset_preserve_other_keys_and_mask_secrets() {
 fn environment_precedes_file_and_legacy_bitbucket_token_is_supported() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
-    std::fs::write(&path, "[github]\ntoken='file-secret'\n[bitbucket]\ntoken='file-bitbucket'\nworkspace='file-team'\n").unwrap();
+    std::fs::write(&path, "[github]\ntoken='file-secret'\n[bitbucket]\ntoken='file-bitbucket'\nemail='file@example.test'\nworkspace='file-team'\n").unwrap();
     let output = command(&path)
         .args(["list", "--format", "json"])
         .env("DEV_METRICS_GITHUB_TOKEN", "env-secret")
         .env("DEV_METRICS_BITBUCKET_WORKSPACE", "env-team")
+        .env("DEV_METRICS_BITBUCKET_EMAIL", "env@example.test")
         .env("BITBUCKET_TOKEN", "legacy-secret")
         .output()
         .unwrap();
@@ -145,6 +147,8 @@ fn environment_precedes_file_and_legacy_bitbucket_token_is_supported() {
     assert_eq!(values["github.token"]["source"], "env");
     assert_eq!(values["github.token"]["value"], "[masqué]");
     assert_eq!(values["bitbucket.workspace"]["value"], "env-team");
+    assert_eq!(values["bitbucket.email"]["value"], "env@example.test");
+    assert_eq!(values["bitbucket.email"]["source"], "env");
     assert_eq!(values["bitbucket.token"]["source"], "env");
     assert!(!String::from_utf8_lossy(&output.stdout).contains("secret"));
 }
@@ -183,6 +187,183 @@ fn path_json_does_not_require_existing_file() {
 }
 
 #[test]
+fn check_reports_missing_configured_tokens_in_json_with_nonzero_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "").unwrap();
+    let output = run(&path, &["check", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let report = json(&output);
+    assert_eq!(report["github"]["status"], "skipped");
+    assert_eq!(report["bitbucket"]["status"], "skipped");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn config_help_explains_token_permissions_and_creation_links() {
+    for arguments in [vec!["config", "--help"], vec!["config", "init", "--help"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+            .args(arguments)
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).unwrap();
+        for expected in [
+            "Metadata",
+            "Contents",
+            "Pull requests",
+            "public_repo",
+            "read:org",
+            "https://github.com/settings/personal-access-tokens/new",
+            "read:repository:bitbucket",
+            "read:pullrequest:bitbucket",
+            "read:user:bitbucket",
+            "read:workspace:bitbucket",
+            "https://id.atlassian.com/manage-profile/security/api-tokens",
+        ] {
+            assert!(help.contains(expected), "{expected} absent de l'aide");
+        }
+    }
+}
+
+#[test]
+fn bitbucket_email_is_distinct_from_the_user_identity_and_validated() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let created = run(
+        &path,
+        &[
+            "init",
+            "--non-interactive",
+            "--bitbucket-email",
+            "alice@example.test",
+            "--bitbucket-username",
+            "alice",
+            "--bitbucket-token",
+            "fake-bitbucket-token",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("email = \"alice@example.test\""));
+    assert!(dev_metrics::config::Config::parse(&saved).is_ok());
+    let invalid = run(&path, &["set", "bitbucket.email", "bad/email"]);
+    assert_eq!(error(&invalid)["code"], "CONFIGURATION_ERROR");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+}
+
+#[test]
+fn init_accepts_an_email_entered_as_bitbucket_username() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let output = run(
+        &path,
+        &[
+            "init",
+            "--non-interactive",
+            "--bitbucket-username",
+            "prenom.nom@domaine.com",
+            "--bitbucket-token",
+            "fake-bitbucket-token",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("email = \"prenom.nom@domaine.com\""));
+    assert!(!saved.contains("username ="));
+}
+
+#[test]
+fn interactive_init_reprompts_only_invalid_field_and_keeps_prior_answers() {
+    use std::io::Write;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let mut child = command(&path)
+        .arg("init")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(
+        b"fake-github-token\nalice@example.test\nbad/path\nalice\nfake-bitbucket-token\nteam\n\nreports\n",
+    ).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.stdout.is_empty());
+    let invalid: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(invalid["code"], "CONFIGURATION_ERROR");
+    assert_eq!(invalid["details"]["key"], "bitbucket.username");
+    assert!(
+        invalid["details"]["expected"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        invalid["details"]["example"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let config = dev_metrics::config::Config::parse(&saved).unwrap();
+    assert_eq!(
+        config.github.unwrap().token.as_deref(),
+        Some("fake-github-token")
+    );
+    let bitbucket = config.bitbucket.unwrap();
+    assert_eq!(bitbucket.username.as_deref(), Some("alice"));
+    assert!(saved.contains("email = \"alice@example.test\""));
+}
+
+#[test]
+fn invalid_noninteractive_init_reports_key_expected_value_and_example() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let output = run(
+        &path,
+        &[
+            "init",
+            "--non-interactive",
+            "--bitbucket-username",
+            "bad/path",
+        ],
+    );
+    let failure = error(&output);
+    assert_eq!(failure["details"]["key"], "bitbucket.username");
+    assert!(
+        failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("bitbucket.username")
+    );
+    assert!(
+        failure["details"]["expected"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        failure["details"]["example"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(!path.exists());
+}
+
+#[test]
 fn interactive_init_requires_confirmation_and_accepts_answers() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
@@ -208,7 +389,7 @@ fn interactive_init_requires_confirmation_and_accepts_answers() {
         use std::io::Write;
         let input = child.stdin.as_mut().unwrap();
         input
-            .write_all(b"yes\nfake-token\nalice\n\nteam\n*.snap\nreports\n")
+            .write_all(b"yes\nfake-token\n\nalice\n\nteam\n*.snap\nreports\n")
             .unwrap();
     }
     let accepted = child.wait_with_output().unwrap();
@@ -280,6 +461,8 @@ fn interactive_token_input_is_not_echoed_to_the_terminal() {
         "config.toml",
         "config",
         "init",
+        "--bitbucket-email",
+        "alice@example.test",
         "--bitbucket-username",
         "alice",
         "--bitbucket-token",
@@ -290,7 +473,7 @@ fn interactive_token_input_is_not_echoed_to_the_terminal() {
         "",
     ]);
     #[cfg(not(target_os = "macos"))]
-    command.args(["-q", "-f", "-c", &format!("{} --config config.toml config init --bitbucket-username alice --bitbucket-token fake-bitbucket-token --bitbucket-workspace team --metrics-excluded-files ''", env!("CARGO_BIN_EXE_dev-metrics")), "/dev/null"]);
+    command.args(["-q", "-f", "-c", &format!("{} --config config.toml config init --bitbucket-email alice@example.test --bitbucket-username alice --bitbucket-token fake-bitbucket-token --bitbucket-workspace team --metrics-excluded-files ''", env!("CARGO_BIN_EXE_dev-metrics")), "/dev/null"]);
     let mut child = command
         .current_dir(directory.path())
         .stdin(Stdio::piped())
@@ -345,6 +528,7 @@ fn interactive_token_input_is_not_echoed_to_the_terminal() {
         String::from_utf8_lossy(&captured)
     );
     assert!(String::from_utf8_lossy(&captured).contains("reports"));
+    assert!(String::from_utf8_lossy(&captured).contains("Metadata"));
     let path = directory.path().join("config.toml");
     assert_eq!(
         dev_metrics::config::Config::load(&path)

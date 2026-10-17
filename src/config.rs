@@ -31,6 +31,7 @@ impl std::fmt::Debug for GitHubConfig {
 #[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BitbucketConfig {
+    pub email: Option<String>,
     pub username: Option<String>,
     pub workspace: Option<String>,
     pub token: Option<String>,
@@ -75,6 +76,7 @@ impl Config {
     ) -> Result<(), String> {
         for key in [
             "bitbucket.username",
+            "bitbucket.email",
             "bitbucket.token",
             "bitbucket.workspace",
         ] {
@@ -87,34 +89,17 @@ impl Config {
             }
             if let Some(value) = environment_value(key)? {
                 validate_setting(key, &value)?;
+                let bitbucket = self.bitbucket.get_or_insert(BitbucketConfig {
+                    email: None,
+                    username: None,
+                    token: None,
+                    workspace: None,
+                });
                 match key {
-                    "bitbucket.username" => {
-                        self.bitbucket
-                            .get_or_insert(BitbucketConfig {
-                                username: None,
-                                token: None,
-                                workspace: None,
-                            })
-                            .username = Some(value)
-                    }
-                    "bitbucket.token" => {
-                        self.bitbucket
-                            .get_or_insert(BitbucketConfig {
-                                username: None,
-                                token: None,
-                                workspace: None,
-                            })
-                            .token = Some(value)
-                    }
-                    "bitbucket.workspace" => {
-                        self.bitbucket
-                            .get_or_insert(BitbucketConfig {
-                                username: None,
-                                token: None,
-                                workspace: None,
-                            })
-                            .workspace = Some(value)
-                    }
+                    "bitbucket.username" => bitbucket.username = Some(value),
+                    "bitbucket.email" => bitbucket.email = Some(value),
+                    "bitbucket.token" => bitbucket.token = Some(value),
+                    "bitbucket.workspace" => bitbucket.workspace = Some(value),
                     _ => unreachable!(),
                 }
             }
@@ -127,6 +112,7 @@ pub fn environment_value(key: &str) -> Result<Option<String>, String> {
     let name = match key {
         "github.token" => "DEV_METRICS_GITHUB_TOKEN",
         "bitbucket.username" => "DEV_METRICS_BITBUCKET_USERNAME",
+        "bitbucket.email" => "DEV_METRICS_BITBUCKET_EMAIL",
         "bitbucket.token" => "DEV_METRICS_BITBUCKET_TOKEN",
         "bitbucket.workspace" => "DEV_METRICS_BITBUCKET_WORKSPACE",
         _ => return Ok(None),
@@ -152,12 +138,33 @@ pub fn configured_value<'a>(table: &'a toml::Table, key: &str) -> Option<&'a tom
     }
 }
 
+fn valid_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    local.split('.').all(|part| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&byte))
+    }) && domain.split('.').count() >= 2
+        && domain.split('.').all(|part| {
+            !part.is_empty()
+                && part.as_bytes()[0].is_ascii_alphanumeric()
+                && part.as_bytes()[part.len() - 1].is_ascii_alphanumeric()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
 pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
     let valid = match key {
         "github.token" | "bitbucket.token" => {
             !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
         }
         "bitbucket.username" => crate::bitbucket::valid_user_identifier(value),
+        "bitbucket.email" => valid_email(value),
         "bitbucket.workspace" => {
             !value.is_empty()
                 && value
@@ -308,6 +315,11 @@ mod tests {
             ("bitbucket.workspace", "bad/path"),
             ("bitbucket.username", "bad/path"),
             ("bitbucket.username", ""),
+            ("bitbucket.email", "bad/email"),
+            ("bitbucket.email", "alice@@example.test"),
+            ("bitbucket.email", "bad[foo]@example.test"),
+            ("bitbucket.email", "alice@example..test"),
+            ("bitbucket.email", "alice:admin@example.test"),
             ("metrics.excluded_files", "*.snap,,generated/*"),
             ("output_dir", ""),
         ] {
@@ -319,6 +331,7 @@ mod tests {
         for (key, value) in [
             ("github.token", "fake-token"),
             ("bitbucket.workspace", "team_1"),
+            ("bitbucket.email", "prenom.nom@domaine.com"),
             ("metrics.excluded_files", ""),
         ] {
             assert!(validate_setting(key, value).is_ok());

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 pub mod config;
 pub mod error;
 
-pub const EXIT_HELP: &str = "Sorties : succès sur stdout ; erreurs JSON {code,message,details} sur stderr.\nCodes de sortie : 0 succès/aide ; 1 écriture ; 2 arguments/période ; 3 configuration ; 4 authentification locale ; 5 collecte/calcul.\nAucun rapport partiel en cas d'échec de collecte ou de calcul.";
+pub const EXIT_HELP: &str = "Sorties : succès sur stdout ; erreurs JSON {code,message,details} sur stderr.\nCodes de sortie : 0 succès/aide ; 1 écriture ; 2 arguments/période ; 3 configuration ; 4 authentification/vérification des accès ; 5 collecte/calcul.\nAucun rapport partiel en cas d'échec de collecte ou de calcul.";
 
 #[derive(Debug, Parser)]
 #[command(name = "dev-metrics", version, about = "Métriques de développement pour un humain ou un bot LLM", after_help = format!("Exemples :\n  dev-metrics config init\n  dev-metrics report\n  dev-metrics report --format table\n  dev-metrics report --since 2026-10-01 --until 2026-10-15 --format markdown\n  dev-metrics schema\n  dev-metrics github --help\n  dev-metrics bitbucket --help\n  dev-metrics --config ./config.toml report\n\n{EXIT_HELP}"))]
@@ -22,7 +22,7 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum Command {
-    #[command(about = "Créer, lire et modifier la configuration", after_help = format!("Exemples :\n  dev-metrics config init\n  dev-metrics config init --non-interactive --github-token TOKEN --bitbucket-workspace team\n  dev-metrics config set bitbucket.workspace team\n  dev-metrics config get github.token --format json\n  dev-metrics config list --format json\n  dev-metrics config path\n\n{EXIT_HELP}"))]
+    #[command(about = "Créer, lire et modifier la configuration", after_help = format!("Exemples :\n  dev-metrics config init\n  dev-metrics config init --non-interactive --github-token TOKEN --bitbucket-workspace team\n  dev-metrics config check --format json\n  dev-metrics config set bitbucket.workspace team\n  dev-metrics config get github.token --format json\n  dev-metrics config list --format json\n  dev-metrics config path\n\n{}{}\n{EXIT_HELP}", config::GITHUB_TOKEN_HELP, config::BITBUCKET_TOKEN_HELP))]
     Config {
         #[command(subcommand)]
         action: config::ConfigAction,
