@@ -56,6 +56,11 @@ fn run(
     if cli.command == Command::Schema {
         return Ok(REPORT_SCHEMA.into());
     }
+    if let Command::Config { action } = cli.command {
+        let path = config_path(cli.config, std::env::var_os("HOME"))
+            .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
+        return cli::config::run(action, &path);
+    }
     let invalid_period = |error| CommandError::new(ErrorCode::InvalidPeriod, error);
     let period = match &cli.command {
         Command::Github { from, to, .. } | Command::Bitbucket { from, to, .. } => {
@@ -96,12 +101,26 @@ fn run(
             }
             period
         }
-        Command::Schema => unreachable!(),
+        Command::Schema | Command::Config { .. } => unreachable!(),
     };
     let path = config_path(cli.config, std::env::var_os("HOME"))
         .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
-    let config = Config::load(&path)
+    let mut config = Config::load(&path)
         .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
+    let config_error = |error| CommandError::new(ErrorCode::ConfigurationError, error);
+    match &cli.command {
+        Command::Github { .. } => config.apply_github_environment().map_err(config_error)?,
+        Command::Bitbucket { .. } => config.apply_bitbucket_environment().map_err(config_error)?,
+        Command::Report { source, .. } => {
+            if source.contains(&SourceKind::Github) {
+                config.apply_github_environment().map_err(config_error)?;
+            }
+            if source.contains(&SourceKind::Bitbucket) {
+                config.apply_bitbucket_environment().map_err(config_error)?;
+            }
+        }
+        Command::Config { .. } | Command::Schema => unreachable!(),
+    }
     let (kind, user, workspace, format) = match cli.command {
         Command::Github { user, format, .. } => (SourceKind::Github, user, None, format),
         Command::Bitbucket {
@@ -155,7 +174,7 @@ fn run(
                 ReportFormat::Markdown => Ok(report.markdown()),
             };
         }
-        Command::Schema => unreachable!(),
+        Command::Schema | Command::Config { .. } => unreachable!(),
     };
     let source = source_factory(kind, &config, workspace.as_deref())?;
     let activity = source
@@ -175,8 +194,9 @@ fn load_source(
     config: &Config,
     workspace: Option<&str>,
 ) -> Result<Box<dyn ActivitySource>, CommandError> {
-    let auth_error =
-        |error| CommandError::new(ErrorCode::AuthenticationError, error).source(kind.as_str());
+    let auth_error = |error: Box<dyn std::error::Error>| {
+        CommandError::new(ErrorCode::AuthenticationError, error).source(kind.as_str())
+    };
     match kind {
         SourceKind::Github => {
             let configured = config
@@ -202,7 +222,8 @@ fn load_source(
                 CommandError::new(ErrorCode::ConfigurationError, error).source("bitbucket")
             })?;
             let token = dev_metrics::bitbucket::resolve_token(
-                std::env::var_os("BITBUCKET_TOKEN"),
+                std::env::var_os("DEV_METRICS_BITBUCKET_TOKEN")
+                    .or_else(|| std::env::var_os("BITBUCKET_TOKEN")),
                 configured.and_then(|config| config.token.as_deref()),
             )
             .map_err(auth_error)?;

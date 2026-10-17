@@ -31,6 +31,7 @@ impl std::fmt::Debug for GitHubConfig {
 #[derive(Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BitbucketConfig {
+    pub username: Option<String>,
     pub workspace: Option<String>,
     pub token: Option<String>,
 }
@@ -39,6 +40,7 @@ impl std::fmt::Debug for BitbucketConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("BitbucketConfig")
+            .field("username", &self.username)
             .field("workspace", &self.workspace)
             .field("token", &self.token.as_ref().map(|_| "[masqué]"))
             .finish()
@@ -55,6 +57,120 @@ impl Config {
 
     pub fn parse(source: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(source)
+    }
+
+    pub fn apply_github_environment(&mut self) -> Result<(), String> {
+        if let Some(value) = environment_value("github.token")? {
+            validate_setting("github.token", &value)?;
+            self.github
+                .get_or_insert(GitHubConfig { token: None })
+                .token = Some(value);
+        }
+        Ok(())
+    }
+
+    pub fn apply_bitbucket_environment(&mut self) -> Result<(), String> {
+        for key in [
+            "bitbucket.username",
+            "bitbucket.token",
+            "bitbucket.workspace",
+        ] {
+            if key == "bitbucket.token" && std::env::var_os("DEV_METRICS_BITBUCKET_TOKEN").is_none()
+            {
+                continue;
+            }
+            if let Some(value) = environment_value(key)? {
+                validate_setting(key, &value)?;
+                match key {
+                    "bitbucket.username" => {
+                        self.bitbucket
+                            .get_or_insert(BitbucketConfig {
+                                username: None,
+                                token: None,
+                                workspace: None,
+                            })
+                            .username = Some(value)
+                    }
+                    "bitbucket.token" => {
+                        self.bitbucket
+                            .get_or_insert(BitbucketConfig {
+                                username: None,
+                                token: None,
+                                workspace: None,
+                            })
+                            .token = Some(value)
+                    }
+                    "bitbucket.workspace" => {
+                        self.bitbucket
+                            .get_or_insert(BitbucketConfig {
+                                username: None,
+                                token: None,
+                                workspace: None,
+                            })
+                            .workspace = Some(value)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn environment_value(key: &str) -> Result<Option<String>, String> {
+    let name = match key {
+        "github.token" => "DEV_METRICS_GITHUB_TOKEN",
+        "bitbucket.username" => "DEV_METRICS_BITBUCKET_USERNAME",
+        "bitbucket.token" => "DEV_METRICS_BITBUCKET_TOKEN",
+        "bitbucket.workspace" => "DEV_METRICS_BITBUCKET_WORKSPACE",
+        _ => return Ok(None),
+    };
+    let value = std::env::var_os(name).or_else(|| {
+        (key == "bitbucket.token")
+            .then(|| std::env::var_os("BITBUCKET_TOKEN"))
+            .flatten()
+    });
+    value
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| format!("Variable d'environnement {name} invalide"))
+        })
+        .transpose()
+}
+
+pub fn configured_value<'a>(table: &'a toml::Table, key: &str) -> Option<&'a toml::Value> {
+    match key.split_once('.') {
+        Some((section, field)) => table.get(section)?.as_table()?.get(field),
+        None => table.get(key),
+    }
+}
+
+pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
+    let valid = match key {
+        "github.token" | "bitbucket.token" => {
+            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
+        }
+        "bitbucket.username" => !value.trim().is_empty() && !value.chars().any(char::is_control),
+        "bitbucket.workspace" => {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }
+        "metrics.excluded_files" => {
+            value.is_empty()
+                || value
+                    .split(',')
+                    .all(|part| !part.trim().is_empty() && !part.chars().any(char::is_control))
+        }
+        "output_dir" => !value.trim().is_empty() && !value.chars().any(char::is_control),
+        _ => return Err("Clé de configuration inconnue".into()),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!("Valeur invalide pour {key}"))
     }
 }
 
@@ -177,6 +293,29 @@ mod tests {
             Config::load(&path).unwrap().output_dir,
             Some(PathBuf::from("weekly-notes"))
         );
+    }
+
+    #[test]
+    fn validates_configurable_values_without_exposing_input() {
+        for (key, value) in [
+            ("github.token", "bad token"),
+            ("bitbucket.workspace", "bad/path"),
+            ("bitbucket.username", ""),
+            ("metrics.excluded_files", "*.snap,,generated/*"),
+            ("output_dir", ""),
+        ] {
+            let error = validate_setting(key, value).unwrap_err();
+            if !value.is_empty() {
+                assert!(!error.contains(value));
+            }
+        }
+        for (key, value) in [
+            ("github.token", "fake-token"),
+            ("bitbucket.workspace", "team_1"),
+            ("metrics.excluded_files", ""),
+        ] {
+            assert!(validate_setting(key, value).is_ok());
+        }
     }
 
     #[test]

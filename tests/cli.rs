@@ -1,5 +1,19 @@
 use std::process::{Command, Output};
 
+fn isolated_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dev-metrics"));
+    for name in [
+        "DEV_METRICS_GITHUB_TOKEN",
+        "DEV_METRICS_BITBUCKET_USERNAME",
+        "DEV_METRICS_BITBUCKET_TOKEN",
+        "DEV_METRICS_BITBUCKET_WORKSPACE",
+        "BITBUCKET_TOKEN",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
@@ -17,7 +31,7 @@ fn help_works_without_home_or_config() {
         vec!["github", "--help"],
         vec!["bitbucket", "--help"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+        let output = isolated_command()
             .args(arguments)
             .env_remove("HOME")
             .output()
@@ -35,7 +49,7 @@ fn help_works_without_home_or_config() {
 #[test]
 fn github_requires_credentials_without_gh_or_configured_token() {
     let directory = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+    let output = isolated_command()
         .args([
             "github",
             "--from",
@@ -66,7 +80,7 @@ fn github_requires_credentials_without_gh_or_configured_token() {
 #[test]
 fn report_loads_explicit_config_without_home() {
     let directory = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+    let output = isolated_command()
         .args(["--config", "config.example.toml", "report"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env_remove("HOME")
@@ -84,7 +98,7 @@ fn loads_default_config_under_home() {
     let directory = home.path().join(".config/dev-metrics");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("config.toml"), "output_dir = 'weekly-notes'").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+    let output = isolated_command()
         .arg("report")
         .env("HOME", home.path())
         .env("PATH", home.path())
@@ -100,7 +114,7 @@ fn config_override_ignores_invalid_default_file() {
     let directory = home.path().join(".config/dev-metrics");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(directory.join("config.toml"), "invalid TOML").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+    let output = isolated_command()
         .args(["report", "--config", "config.example.toml"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("HOME", home.path())
@@ -122,7 +136,7 @@ fn config_failures_return_structured_errors_without_stdout() {
         if let Some(content) = content {
             std::fs::write(&path, content).unwrap();
         }
-        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+        let output = isolated_command()
             .arg("report")
             .arg("--config")
             .arg(&path)
@@ -140,7 +154,7 @@ fn config_failures_return_structured_errors_without_stdout() {
 
 #[test]
 fn missing_home_requires_explicit_config() {
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+    let output = isolated_command()
         .arg("report")
         .env_remove("HOME")
         .output()
@@ -173,7 +187,7 @@ fn github_rejects_missing_dates_invalid_periods_and_unknown_formats() {
             "yaml",
         ],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+        let output = isolated_command()
             .args(arguments)
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
@@ -220,7 +234,7 @@ fn bitbucket_resolves_workspace_and_token_without_printing_partial_output() {
         ),
     ] {
         std::fs::write(&path, config).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_dev-metrics"));
+        let mut command = isolated_command();
         command
             .args(["bitbucket", "--from", "2026-10-01", "--to", "2026-10-07"])
             .args(args)
@@ -256,7 +270,7 @@ fn bitbucket_resolves_workspace_and_token_without_printing_partial_output() {
 
 #[test]
 fn schema_is_available_without_configuration_and_matches_the_embedded_contract() {
-    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+    let output = isolated_command()
         .arg("schema")
         .env_remove("HOME")
         .output()
@@ -286,7 +300,7 @@ fn argument_errors_are_json_on_stderr_with_exit_two_and_no_stdout() {
         vec!["report", "--since", "0000-01-01", "--until", "0000-01-01"],
         vec!["report", "--until", "2026-10-30T12:00:00Z"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+        let output = isolated_command()
             .args(&arguments)
             .env_remove("HOME")
             .output()
