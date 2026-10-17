@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub output_dir: PathBuf,
+    #[serde(default)]
+    pub metrics: crate::metrics::MetricsConfig,
     pub github: Option<GitHubConfig>,
     pub bitbucket: Option<BitbucketConfig>,
 }
@@ -93,6 +95,36 @@ mod tests {
         assert!(
             Config::parse("output_dir = './reports'\n[github]\ntoken = 'configured-token'").is_ok()
         );
+    }
+
+    #[test]
+    fn accepts_metrics_exclusion_configuration() {
+        let config =
+            Config::parse("output_dir = './reports'\n[metrics]\nexcluded_files = ['*.snap']")
+                .unwrap();
+        assert_eq!(config.metrics.excluded_files, vec!["*.snap"]);
+        for source in [
+            "output_dir = './reports'",
+            "output_dir = './reports'\n[metrics]",
+        ] {
+            assert_eq!(
+                Config::parse(source).unwrap().metrics,
+                crate::metrics::MetricsConfig::default()
+            );
+        }
+        assert!(
+            Config::parse("output_dir = './reports'\n[metrics]\nexcluded_files = []")
+                .unwrap()
+                .metrics
+                .excluded_files
+                .is_empty()
+        );
+        for source in [
+            "output_dir = './reports'\n[metrics]\nexcluded_files = 42",
+            "output_dir = './reports'\n[metrics]\nunknown = true",
+        ] {
+            assert!(Config::parse(source).is_err());
+        }
     }
 
     #[test]

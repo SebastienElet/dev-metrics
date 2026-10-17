@@ -14,6 +14,24 @@ pub struct GitHubSource {
     api: Api,
 }
 
+impl ActivitySource for GitHubSource {
+    fn collect_activity(
+        &self,
+        user: Option<&str>,
+        period: Period,
+    ) -> Result<Activity, Box<dyn Error>> {
+        let authenticated;
+        let user = match user {
+            Some(user) => user,
+            None => {
+                authenticated = self.authenticated_user()?;
+                &authenticated
+            }
+        };
+        self.activity(user, period)
+    }
+}
+
 impl GitHubSource {
     pub fn new(api_base: Url, token: &str) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
