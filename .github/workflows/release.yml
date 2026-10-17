@@ -119,16 +119,7 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null; then
-            mkdir existing
-            gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir existing
-            release_state=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
-            bash .github/scripts/check-release-assets.sh dist existing "$release_state"
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
-          fi
+        run: bash .github/scripts/publish-github-release.sh dist "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY"
       - name: Record verified asset digests
         run: sha256sum dist/* > release-assets.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
