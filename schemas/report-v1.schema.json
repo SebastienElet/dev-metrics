@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SebastienElet/dev-metrics/blob/main/schemas/report-v1.schema.json",
+  "title": "Rapport de métriques v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "windows",
+    "by_source",
+    "by_repository"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "windows": {
+      "$ref": "#/$defs/windows"
+    },
+    "by_source": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source_metrics"
+      }
+    },
+    "by_repository": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/repository_metrics"
+      }
+    }
+  },
+  "$defs": {
+    "period": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from",
+        "to"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "format": "date"
+        },
+        "to": {
+          "type": "string",
+          "format": "date"
+        }
+      }
+    },
+    "count": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "current",
+        "previous",
+        "delta",
+        "delta_percent"
+      ],
+      "properties": {
+        "current": {
+          "type": "number",
+          "minimum": 0
+        },
+        "previous": {
+          "type": "number",
+          "minimum": 0
+        },
+        "delta": {
+          "type": "number"
+        },
+        "delta_percent": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "optional": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "current",
+        "previous",
+        "delta",
+        "delta_percent"
+      ],
+      "properties": {
+        "current": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "previous": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "delta": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "delta_percent": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "percent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "current",
+        "previous",
+        "delta",
+        "delta_percent"
+      ],
+      "properties": {
+        "current": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "previous": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100
+        },
+        "delta": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "delta_percent": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pull_requests_opened",
+        "pull_requests_merged",
+        "commits",
+        "lines_added",
+        "lines_deleted",
+        "median_merge_seconds",
+        "median_first_review_seconds",
+        "median_pull_request_lines",
+        "large_pull_request_percent",
+        "reviews_given",
+        "comments_left",
+        "reviews_received"
+      ],
+      "properties": {
+        "pull_requests_opened": {
+          "$ref": "#/$defs/count"
+        },
+        "pull_requests_merged": {
+          "$ref": "#/$defs/count"
+        },
+        "commits": {
+          "$ref": "#/$defs/count"
+        },
+        "lines_added": {
+          "$ref": "#/$defs/count"
+        },
+        "lines_deleted": {
+          "$ref": "#/$defs/count"
+        },
+        "median_merge_seconds": {
+          "$ref": "#/$defs/optional"
+        },
+        "median_first_review_seconds": {
+          "$ref": "#/$defs/optional"
+        },
+        "median_pull_request_lines": {
+          "$ref": "#/$defs/optional"
+        },
+        "large_pull_request_percent": {
+          "$ref": "#/$defs/percent"
+        },
+        "reviews_given": {
+          "$ref": "#/$defs/count"
+        },
+        "comments_left": {
+          "$ref": "#/$defs/count"
+        },
+        "reviews_received": {
+          "$ref": "#/$defs/count"
+        }
+      }
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "days",
+        "current_period",
+        "previous_period",
+        "metrics"
+      ],
+      "properties": {
+        "days": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "current_period": {
+          "$ref": "#/$defs/period"
+        },
+        "previous_period": {
+          "$ref": "#/$defs/period"
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics"
+        }
+      }
+    },
+    "windows": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "items": {
+        "$ref": "#/$defs/window"
+      }
+    },
+    "source": {
+      "enum": [
+        "github",
+        "bitbucket"
+      ]
+    },
+    "source_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "windows"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "windows": {
+          "$ref": "#/$defs/windows"
+        }
+      }
+    },
+    "repository_metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "repository",
+        "windows"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "windows": {
+          "$ref": "#/$defs/windows"
+        }
+      }
+    }
+  }
+}

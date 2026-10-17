@@ -13,7 +13,7 @@ fn help_works_without_home_or_config() {
     for arguments in [
         vec!["--help"],
         vec!["report", "--help"],
-        vec!["schedule", "--help"],
+        vec!["schema", "--help"],
         vec!["github", "--help"],
         vec!["bitbucket", "--help"],
     ] {
@@ -26,6 +26,9 @@ fn help_works_without_home_or_config() {
         assert!(stdout(&output).contains("Usage:"));
         assert!(stdout(&output).contains("Usage: dev-metrics"));
         assert!(stdout(&output).contains("--config"));
+        assert!(stdout(&output).contains("Exemple"));
+        assert!(stdout(&output).contains("Codes de sortie :"));
+        assert!(output.stderr.is_empty());
     }
 }
 
@@ -48,7 +51,10 @@ fn github_requires_credentials_without_gh_or_configured_token() {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(4));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["code"], "AUTHENTICATION_ERROR");
+    assert_eq!(error["details"]["source"], "github");
     assert!(stdout(&output).is_empty());
     assert!(
         stderr(&output).contains("Authentification GitHub absente"),
@@ -58,18 +64,18 @@ fn github_requires_credentials_without_gh_or_configured_token() {
 }
 
 #[test]
-fn placeholders_load_explicit_config_without_home() {
-    for command in ["report", "schedule"] {
-        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
-            .args(["--config", "config.example.toml", command])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .env_remove("HOME")
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", stderr(&output));
-        assert!(stdout(&output).contains("non implémenté"));
-        assert!(stdout(&output).contains("./reports"));
-    }
+fn report_loads_explicit_config_without_home() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+        .args(["--config", "config.example.toml", "report"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env_remove("HOME")
+        .env("PATH", directory.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("Authentification GitHub absente"));
 }
 
 #[test]
@@ -81,10 +87,11 @@ fn loads_default_config_under_home() {
     let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
         .arg("report")
         .env("HOME", home.path())
+        .env("PATH", home.path())
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("weekly-notes"));
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty());
 }
 
 #[test]
@@ -97,14 +104,15 @@ fn config_override_ignores_invalid_default_file() {
         .args(["report", "--config", "config.example.toml"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .env("HOME", home.path())
+        .env("PATH", home.path())
         .output()
         .unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
-    assert!(stdout(&output).contains("./reports"));
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    assert!(stdout(&output).is_empty());
 }
 
 #[test]
-fn config_failures_return_nonzero_without_placeholder_output() {
+fn config_failures_return_structured_errors_without_stdout() {
     let directory = tempfile::tempdir().unwrap();
     for (filename, content) in [
         ("missing.toml", None),
@@ -123,6 +131,10 @@ fn config_failures_return_nonzero_without_placeholder_output() {
         assert!(!output.status.success());
         assert!(stdout(&output).is_empty());
         assert!(stderr(&output).contains(&path.display().to_string()));
+        assert_eq!(output.status.code(), Some(3));
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["code"], "CONFIGURATION_ERROR");
+        assert!(error["details"].is_object());
     }
 }
 
@@ -135,6 +147,7 @@ fn missing_home_requires_explicit_config() {
         .unwrap();
     assert!(!output.status.success());
     assert!(stderr(&output).contains("--config"));
+    assert_eq!(output.status.code(), Some(3));
 }
 
 #[test]
@@ -222,5 +235,72 @@ fn bitbucket_resolves_workspace_and_token_without_printing_partial_output() {
         assert!(stdout(&output).is_empty());
         assert!(stderr(&output).contains(expected), "{}", stderr(&output));
         assert!(!stderr(&output).contains("secret"));
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        let expected_code = if expected.starts_with("Workspace") {
+            "CONFIGURATION_ERROR"
+        } else {
+            "AUTHENTICATION_ERROR"
+        };
+        assert_eq!(error["code"], expected_code);
+        assert_eq!(error["details"]["source"], "bitbucket");
+        assert_eq!(
+            output.status.code(),
+            Some(if expected.starts_with("Workspace") {
+                3
+            } else {
+                4
+            })
+        );
+    }
+}
+
+#[test]
+fn schema_is_available_without_configuration_and_matches_the_embedded_contract() {
+    let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+        .arg("schema")
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let schema: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        schema,
+        serde_json::from_str::<serde_json::Value>(dev_metrics::metrics::REPORT_SCHEMA).unwrap()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn argument_errors_are_json_on_stderr_with_exit_two_and_no_stdout() {
+    for arguments in [
+        vec![],
+        vec!["unknown"],
+        vec!["report", "--format", "yaml"],
+        vec!["report", "--source", "unknown"],
+        vec!["report", "--source", "bitbucket", "--github-user", "alice"],
+        vec!["report", "--workspace", "team"],
+        vec!["report", "--bitbucket-user", "{alice}"],
+        vec!["report", "--until", "0000-01-15"],
+        vec!["report", "--until", "2026-02-30"],
+        vec!["report", "--since", "2026-10-30", "--until", "2026-10-01"],
+        vec!["report", "--since", "0000-01-01", "--until", "0000-01-01"],
+        vec!["report", "--until", "2026-10-30T12:00:00Z"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dev-metrics"))
+            .args(&arguments)
+            .env_remove("HOME")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{arguments:?}: {}",
+            stderr(&output)
+        );
+        assert!(output.stdout.is_empty());
+        let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(error["code"].as_str().unwrap().starts_with("INVALID_"));
+        assert!(!error["message"].as_str().unwrap().is_empty());
+        assert!(error["details"].is_object());
     }
 }

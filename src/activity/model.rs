@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
@@ -25,6 +25,25 @@ impl Period {
         let to = parse(to)?;
         if from > to {
             return Err("La date de début doit précéder ou égaler la date de fin".into());
+        }
+        Ok(Self { from, to })
+    }
+
+    pub fn end(&self) -> NaiveDate {
+        self.to
+    }
+
+    pub fn days(&self) -> u64 {
+        (self.to - self.from).num_days() as u64 + 1
+    }
+
+    pub fn previous(&self) -> Result<Self, Box<dyn Error>> {
+        let to = self.from.pred_opt().ok_or("Date hors limites")?;
+        let from = to
+            .checked_sub_days(Days::new(self.days() - 1))
+            .ok_or("Date hors limites")?;
+        if from.year() < 0 || self.to.year() > 9999 {
+            return Err("Les périodes comparées doivent rester entre 0000 et 9999".into());
         }
         Ok(Self { from, to })
     }

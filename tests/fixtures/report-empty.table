@@ -1,0 +1,18 @@
+Ensemble
+1 j : 2024-03-01 → 2024-03-01 ; précédent : 2024-02-29 → 2024-02-29 (UTC)
+Métrique                    | 1 j | Δ | Δ %
+----------------------------+-----+---+----
+PRs ouvertes                | 0   | 0 | 0
+PRs mergées                 | 0   | 0 | 0
+Commits                     | 0   | 0 | 0
+Lignes ajoutées             | 0   | 0 | 0
+Lignes supprimées           | 0   | 0 | 0
+Médiane merge (h)           | —   | — | —
+Médiane première review (h) | —   | — | —
+Médiane taille PR (lignes)  | —   | — | —
+PRs > 400 lignes (%)        | —   | — | —
+Reviews faites              | 0   | 0 | 0
+Commentaires laissés        | 0   | 0 | 0
+Reviews reçues              | 0   | 0 | 0
+
+Δ = courant − précédent ; — = non calculable. Part > 400 lignes : Δ en points.

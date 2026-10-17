@@ -2,10 +2,11 @@
 
 CLI Rust pour suivre ses métriques de développement (GitHub, Bitbucket).
 
-Les commandes `github` et `bitbucket` collectent l'activité brute sur une période et la restituent en
-JSON versionné ou en tableau. `report` et `schedule` restent des placeholders :
-le moteur de calcul 7/30 jours est disponible dans la bibliothèque ; son exposition
-CLI (JSON/tableau, #5) et la planification restent à implémenter.
+`report` collecte et calcule les métriques sur 7/30 jours ou une période libre,
+avec comparaison à la période précédente. Sa sortie par défaut est un JSON compact
+versionné pour un bot LLM ; un tableau complet et un résumé Markdown sont disponibles.
+`github` et `bitbucket` exposent également l'activité brute en JSON ou tableau.
+Les résultats vont sur stdout. Aucune planification ni sortie Obsidian n'est fournie.
 
 ## Installation
 
@@ -26,11 +27,9 @@ mkdir -p ~/.config/dev-metrics
 cp config.example.toml ~/.config/dev-metrics/config.toml
 ```
 
-La configuration TOML contient un champ obligatoire :
+La configuration TOML peut être vide ou préciser les sources et exclusions :
 
 ```toml
-output_dir = "./reports"
-
 [github]
 token = "github_pat_..."
 
@@ -39,9 +38,9 @@ workspace = "mon-workspace"
 token = "api_token_..."
 ```
 
-`output_dir` est conservé pour les placeholders. Il est uniquement
-affiché par les placeholders ; aucun répertoire n'est créé. Un chemin relatif
-est relatif au répertoire de travail, et `~` n'est pas développé dans cette valeur.
+L'ancien champ `output_dir` reste accepté, mais est facultatif et ignoré.
+Aucun fichier ni répertoire de rapport n'est créé ; utilisez une redirection shell
+pour conserver la sortie. La sous-commande placeholder `schedule` est supprimée.
 
 Par défaut, le fichier est lu depuis `$HOME/.config/dev-metrics/config.toml`,
 y compris sur macOS. `--config PATH` remplace ce chemin et peut précéder ou suivre
@@ -57,8 +56,8 @@ souhaités : lecture des pull requests, issues et contenus pour les dépôts pri
 Ne commitez pas votre configuration contenant un token.
 
 Un fichier absent, illisible, non UTF-8 ou invalide entraîne une erreur et un code
-de sortie non nul. Les champs inconnus sont rejetés. L'aide et la version ne
-nécessitent aucun fichier de configuration.
+de sortie non nul. Les champs inconnus sont rejetés. L'aide, la version et `schema` ne
+nécessitent aucun fichier de configuration ni accès réseau.
 
 ## Usage
 
@@ -66,9 +65,11 @@ nécessitent aucun fichier de configuration.
 dev-metrics --help
 dev-metrics --version
 dev-metrics report
-dev-metrics schedule
+dev-metrics schema
 dev-metrics --config config.example.toml report
-dev-metrics schedule --config config.example.toml
+dev-metrics report --until 2026-10-30 --format json
+dev-metrics report --since 2026-10-01 --until 2026-10-15 --format markdown
+dev-metrics report --source github,bitbucket --workspace mon-workspace --format table
 dev-metrics github --from 2026-10-01 --to 2026-10-07
 dev-metrics github --from 2026-10-01 --to 2026-10-07 --user octocat --format table
 dev-metrics bitbucket --workspace mon-workspace --from 2026-10-01 --to 2026-10-07
@@ -81,6 +82,116 @@ Sans installation :
 cargo run -- --help
 cargo run -- --config config.example.toml report
 cargo run -- --config config.example.toml github --from 2026-10-01 --to 2026-10-07
+```
+
+## Rapport pour un bot ou un humain
+
+`report` utilise GitHub par défaut. `--source github,bitbucket` active les deux
+sources ; `--source bitbucket` utilise seulement Bitbucket. Les doublons de sources
+sont ignorés. `--github-user` et `--bitbucket-user` remplacent le compte authentifié
+de chaque source ; `--workspace` remplace le workspace Bitbucket configuré.
+Les options d'identité/workspace exigent la source correspondante dans `--source`.
+L'authentification suit les mêmes règles que les commandes d'activité brute.
+
+Sans `--since`, le rapport contient les fenêtres 7 et 30 jours, dans cet ordre.
+`--until` fixe leur fin ; par défaut, c'est la date du jour en UTC. Avec `--since`,
+le rapport contient une seule fenêtre allant de `--since` à `--until`, comparée à
+la période immédiatement précédente de même durée. `--until` reste facultatif.
+Les bornes sont des **dates ISO 8601 `YYYY-MM-DD`, inclusives en UTC**, pas des
+timestamps. Une date invalide, une plage inversée ou une comparaison dépassant
+les années 0000–9999 échoue. Par exemple, le 28–30 octobre est comparé au 25–27
+octobre ; une journée inclut les événements de 00:00:00 à la fin de ce jour UTC.
+
+La collecte couvre les périodes courantes et précédentes en une passe par source :
+60 jours pour 7/30 jours, deux fois la durée pour une période libre. Une longue
+période peut dépasser les limites des APIs documentées ci-dessous ; ces échecs
+ne produisent aucun rapport partiel. Les exclusions de `[metrics]` s'appliquent
+aux rapports, sans modifier l'activité brute.
+
+### Contrat JSON v1
+
+`--format json` est le défaut : un objet JSON compact sur une ligne, suivi d'un
+saut de ligne. Le contrat est [report-v1.schema.json](schemas/report-v1.schema.json),
+également imprimé par `dev-metrics schema` (Draft 2020-12, autonome, sans résolution
+réseau). Cette commande décrit le rapport ; les contrats d'activité brute sont
+liés dans les sections GitHub et Bitbucket.
+
+Le rapport contient :
+
+- `schema_version: 1` ;
+- `windows` : une ou deux fenêtres, avec `days`, `current_period`,
+  `previous_period` (bornes `from`/`to`) et `metrics` ;
+- `by_source` : les mêmes fenêtres par source, GitHub puis Bitbucket ;
+- `by_repository` : les mêmes fenêtres par couple source/dépôt, triées par
+  source puis nom de dépôt.
+
+Chaque métrique contient `current`, `previous`, `delta` et `delta_percent`.
+Les durées JSON sont en **secondes**, les proportions en **pourcentage 0–100** ;
+les deltas de proportion sont en **points de pourcentage**. Les volumes sont des
+nombres non négatifs ; les médianes/proportions sans observations et les deltas
+indéfinis valent `null`, jamais une chaîne ni un champ omis. Les volumes nuls
+restent `0` ; un précédent nul donne `delta_percent: null`, sauf si le courant
+est aussi nul (`0`). Les répartitions vides sont des tableaux vides. Une source
+sélectionnée sans activité conserve ses fenêtres à zéro/`null`.
+
+Les clés et l'ordre des listes sont déterministes pour les mêmes entrées ;
+aucune date d'exécution variable n'est ajoutée. Le schéma est strict : toute
+évolution incompatible (y compris un champ refusé par le schéma v1, un changement
+de type, d'unité ou de sens) doit incrémenter `schema_version` et publier le
+schéma correspondant. Les snapshots et validations JSON Schema font partie de
+`cargo test` ; la compatibilité s'évalue aussi lors de la revue du changement.
+Le contrat des commandes d'activité brute reste en v1, indépendamment de celui
+du rapport. Leur JSON est désormais compact également.
+
+Exemple d'invocation par un bot :
+
+```sh
+dev-metrics schema > report.schema.json
+dev-metrics report --until 2026-10-30 > report.json 2> error.json
+```
+
+Le bot doit vérifier le code de sortie avant de lire le rapport. Les valeurs
+numériques JSON proviennent du moteur `f64` existant : elles ne constituent pas
+un contrat d'entiers exacts au-delà de 2^53.
+
+### Tableau et résumé Markdown
+
+`--format table` affiche toutes les métriques, leurs périodes et deltas, d'abord
+pour l'ensemble puis par source et par dépôt. `--format markdown` fournit un
+résumé global court avec les mêmes métriques et comparaisons ; les répartitions
+détaillées restent disponibles en JSON/tableau. Dans ces deux rendus, les durées
+sont en heures, les nombres arrondis à deux décimales et `—` signifie non calculable.
+La légende rappelle les deltas en points pour la part des PRs > 400 lignes.
+Voir les snapshots [tableau](tests/fixtures/report.table) et
+[Markdown](tests/fixtures/report.md), construits sur un jeu de données fixe.
+
+### Erreurs et codes de sortie
+
+Les erreurs de toutes les commandes, y compris celles du parsing CLI, sont des
+objets JSON compacts sur stderr : `code` stable, `message` lisible, `details` objet.
+Les messages ne sont pas une API à parser. `details.source` identifie la source
+pour une erreur de collecte brute/authentification ; `details.sources` liste les
+sources sélectionnées pour un échec de rapport. Les autres détails sont `{}`.
+L'aide et la version sont du texte sur stdout avec succès.
+
+| Sortie | Codes JSON | Signification |
+| --- | --- | --- |
+| 0 | — | Succès, aide ou version |
+| 1 | `OUTPUT_ERROR` | Échec de sérialisation ou d'écriture sur stdout, y compris pipe fermé |
+| 2 | `INVALID_ARGUMENTS`, `INVALID_PERIOD` | Arguments, format ou période invalides |
+| 3 | `CONFIGURATION_ERROR` | Fichier/configuration indisponible ou invalide, workspace absent/invalide |
+| 4 | `AUTHENTICATION_ERROR` | Identifiant local absent/invalide ou initialisation du client impossible |
+| 5 | `COLLECTION_ERROR`, `REPORT_ERROR` | Collecte brute ou collecte/calcul du rapport en échec |
+
+Un refus HTTP d'un token par l'API relève de la collecte (5), sans changement de
+compte. Les erreurs de configuration/authentification ne reproduisent pas les
+tokens ; les erreurs réseau/API ne reproduisent pas les corps des réponses.
+Aucune sortie de succès n'est écrite avant la fin du calcul et du rendu. Un échec
+d'écriture peut toutefois laisser une sortie tronquée : vérifiez toujours le
+code de sortie. Si stderr est lui-même fermé, le code non nul reste le signal.
+
+```json
+{"code":"AUTHENTICATION_ERROR","message":"Authentification GitHub absente : gh auth token indisponible et aucun token valide dans [github]","details":{"source":"github"}}
 ```
 
 ## Données GitHub
@@ -118,8 +229,7 @@ travail et ne doivent pas être additionnées. Les commentaires de commits et le
 corps des commentaires ne sont pas collectés.
 
 `--format table` affiche ces données brutes, y compris les dates historiques utiles
-pour les PRs retenues. Le rendu CLI des fenêtres 7/30 jours et de leurs
-deltas relève de #5. Une évolution incompatible du contrat JSON nécessitera une nouvelle
+pour les PRs retenues. Utilisez `report --format table` pour les métriques et deltas. Une évolution incompatible du contrat JSON nécessitera une nouvelle
 version du schéma. Les listes vides sont des tableaux vides, les dates absentes
 valent `null`.
 
@@ -207,13 +317,17 @@ La collecte parcourt l'historique accessible des dépôts et PRs du workspace et
 peut coûter beaucoup de requêtes sur un grand workspace. Elle ne reconstruit pas
 les événements supprimés/inaccessibles. Les diffstats de PR reflètent le diff
 actuel, pas une photographie historique. `--format table` restitue l'activité
-brute ; le rendu CLI des agrégations 7/30 jours et des deltas relève de #5.
+brute ; `report --source bitbucket` expose les métriques et deltas.
 
 ## Calcul des métriques
 
 La bibliothèque expose `metrics::calculate(activities, through, config)` pour des
 activités déjà collectées et `metrics::collect(sources, through, config)` pour
-collecter puis calculer. `through` est une date de fin explicite (`NaiveDate`),
+collecter puis calculer. `calculate_period(activities, period, config)` et
+`collect_period(sources, period, config)` acceptent une `Period` libre et renvoient
+une seule fenêtre, avec la même logique de calcul. `MetricsReport::json()`,
+`table()` et `markdown()` produisent les rendus sans recalculer les métriques.
+`through` est une date de fin explicite (`NaiveDate`),
 inclusive en UTC. `SourceRequest` associe un `&dyn ActivitySource` à un utilisateur
 optionnel ; `GitHubSource` et `BitbucketSource` implémentent ce trait en réutilisant
 leur collecte existante. Une identité absente désigne le compte authentifié.
@@ -226,12 +340,14 @@ leurs périodes précédentes. Pour une fin au 30 octobre 2026 :
 | 7 jours | 24–30 octobre | 17–23 octobre |
 | 30 jours | 1–30 octobre | 1–30 septembre |
 
-`calculate` exige que chaque activité couvre ces 60 jours et refuse plusieurs
+`calculate` exige que chaque activité couvre ces 60 jours (`calculate_period` exige
+la couverture de la période libre et de sa précédente) et refuse plusieurs
 collectes pour la même source afin d'éviter le double comptage. Une erreur de
 collecte, un délai négatif ou un dépassement des compteurs de lignes échoue sans
 retourner de rapport partiel. Une entrée vide produit des volumes nuls.
 
-`MetricsReport` fournit deux fenêtres, puis les mêmes calculs par source et par
+`MetricsReport` fournit une ou deux fenêtres selon la période demandée, puis les
+mêmes calculs par source et par
 couple `(source, repository)`. GitHub précède Bitbucket ; les dépôts sont triés par
 nom au sein de chaque source. Une source fournie sans activité conserve ses
 fenêtres vides ; les dépôts proviennent des événements collectés, y compris ceux
@@ -301,10 +417,12 @@ cargo test
 ```
 
 Les tests couvrent le parsing CLI, la configuration et ses erreurs, puis lancent
-le binaire pour vérifier l'aide, les placeholders et les codes de sortie. La
+le binaire pour vérifier l'aide, le schéma, les erreurs JSON et les codes de sortie. Les
 sources GitHub et Bitbucket utilisent des réponses HTTP simulées avec `mockito` pour exercer la
 collecte, la pagination, les dates, les erreurs, les redirections Bitbucket et les sorties. Les snapshots
-JSON/tableau et le moteur `jsonschema` vérifient le contrat de sortie. Les tests
+JSON/tableau/Markdown et le moteur `jsonschema` vérifient les contrats de sortie,
+avec des exemples invalides rejetés par le schéma. Les tests de commande utilisent
+des sources in-memory et une date fixe pour exercer le raccordement de `report`. Les tests
 d'authentification utilisent des exécutables temporaires sous Unix, sans accéder
 aux identifiants de la machine. Les tests unitaires de métriques utilisent des jeux
 de données fixes pour les fenêtres, deltas, médianes, exclusions et répartitions ;

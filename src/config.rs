@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub output_dir: PathBuf,
+    pub output_dir: Option<PathBuf>,
     #[serde(default)]
     pub metrics: crate::metrics::MetricsConfig,
     pub github: Option<GitHubConfig>,
@@ -75,13 +75,19 @@ mod tests {
     #[test]
     fn parses_example_config() {
         let config = Config::parse(include_str!("../config.example.toml")).unwrap();
-        assert_eq!(config.output_dir, PathBuf::from("./reports"));
+        assert_eq!(config.output_dir, Some(PathBuf::from("./reports")));
+    }
+
+    #[test]
+    fn accepts_configuration_without_an_output_directory() {
+        for text in ["", "[github]\ntoken='configured-token'"] {
+            assert!(Config::parse(text).is_ok());
+        }
     }
 
     #[test]
     fn rejects_invalid_config() {
         for source in [
-            "",
             "output_dir = [",
             "output_dir = 42",
             "output_dir = './reports'\nunknown = true",
@@ -169,7 +175,7 @@ mod tests {
         std::fs::write(&path, "output_dir = 'weekly-notes'").unwrap();
         assert_eq!(
             Config::load(&path).unwrap().output_dir,
-            PathBuf::from("weekly-notes")
+            Some(PathBuf::from("weekly-notes"))
         );
     }
 

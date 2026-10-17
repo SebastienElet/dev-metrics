@@ -1,9 +1,12 @@
+mod output;
+pub use output::REPORT_SCHEMA;
+
 use crate::activity::{Activity, ActivitySource, FileChange, Period, Source};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use std::collections::BTreeSet;
 use std::error::Error;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, serde::Serialize)]
 pub struct Comparison {
     pub current: Option<f64>,
     pub previous: Option<f64>,
@@ -34,7 +37,7 @@ impl Comparison {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct Metrics {
     pub pull_requests_opened: Comparison,
     pub pull_requests_merged: Comparison,
@@ -50,7 +53,7 @@ pub struct Metrics {
     pub reviews_received: Comparison,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct WindowMetrics {
     pub days: u64,
     pub current_period: Period,
@@ -58,22 +61,22 @@ pub struct WindowMetrics {
     pub metrics: Metrics,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct SourceMetrics {
     pub source: Source,
-    pub windows: [WindowMetrics; 2],
+    pub windows: Vec<WindowMetrics>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct RepositoryMetrics {
     pub source: Source,
     pub repository: String,
-    pub windows: [WindowMetrics; 2],
+    pub windows: Vec<WindowMetrics>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct MetricsReport {
-    pub windows: [WindowMetrics; 2],
+    pub windows: Vec<WindowMetrics>,
     pub by_source: Vec<SourceMetrics>,
     pub by_repository: Vec<RepositoryMetrics>,
 }
@@ -81,6 +84,27 @@ pub struct MetricsReport {
 pub struct SourceRequest<'a> {
     pub source: &'a dyn ActivitySource,
     pub user: Option<&'a str>,
+}
+
+pub fn calculate_period(
+    activities: &[Activity],
+    period: Period,
+    config: &MetricsConfig,
+) -> Result<MetricsReport, Box<dyn Error>> {
+    calculate_windows(activities, &[period], config)
+}
+
+pub fn collect_period(
+    sources: &[SourceRequest<'_>],
+    period: Period,
+    config: &MetricsConfig,
+) -> Result<MetricsReport, Box<dyn Error>> {
+    let collection_period = Period {
+        from: period.previous()?.from,
+        to: period.to,
+    };
+    let activities = collect_activities(sources, collection_period)?;
+    calculate_period(&activities, period, config)
 }
 
 pub fn collect(
@@ -92,15 +116,22 @@ pub fn collect(
         .checked_sub_days(Days::new(59))
         .ok_or("Date hors limites")?;
     let period = Period { from, to: through };
-    let activities = sources
+    let activities = collect_activities(sources, period)?;
+    calculate(&activities, through, config)
+}
+
+fn collect_activities(
+    sources: &[SourceRequest<'_>],
+    period: Period,
+) -> Result<Vec<Activity>, Box<dyn Error>> {
+    sources
         .iter()
         .map(|request| {
             request
                 .source
                 .collect_activity(request.user, period.clone())
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    calculate(&activities, through, config)
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -185,13 +216,41 @@ pub fn calculate(
     through: NaiveDate,
     config: &MetricsConfig,
 ) -> Result<MetricsReport, Box<dyn Error>> {
-    let from = through
-        .checked_sub_days(Days::new(59))
-        .ok_or("Date hors limites")?;
+    let periods = [7, 30]
+        .map(|days| {
+            through
+                .checked_sub_days(Days::new(days - 1))
+                .map(|from| Period { from, to: through })
+                .ok_or("Date hors limites")
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    calculate_windows(activities, &periods, config)
+}
+
+fn calculate_windows(
+    activities: &[Activity],
+    periods: &[Period],
+    config: &MetricsConfig,
+) -> Result<MetricsReport, Box<dyn Error>> {
+    let previous = periods
+        .iter()
+        .map(Period::previous)
+        .collect::<Result<Vec<_>, _>>()?;
+    let from = previous
+        .iter()
+        .map(|period| period.from)
+        .min()
+        .ok_or("Période absente")?;
+    let through = periods
+        .iter()
+        .map(|period| period.to)
+        .max()
+        .ok_or("Période absente")?;
     let mut sources = BTreeSet::new();
     for activity in activities {
         if activity.period.from > from || activity.period.to < through {
-            return Err("La collecte doit couvrir les 60 jours comparés".into());
+            return Err("La collecte doit couvrir les périodes courantes et précédentes".into());
         }
         if !sources.insert(activity.source.as_str()) {
             return Err("Une seule collecte par source est acceptée".into());
@@ -209,7 +268,7 @@ pub fn calculate(
         }
         by_source.push(SourceMetrics {
             source,
-            windows: windows(activities, through, config, Some(source), None)?,
+            windows: windows(activities, periods, config, Some(source), None)?,
         });
         let repositories: BTreeSet<_> = source_activities
             .iter()
@@ -248,12 +307,12 @@ pub fn calculate(
             by_repository.push(RepositoryMetrics {
                 source,
                 repository: repository.into(),
-                windows: windows(activities, through, config, Some(source), Some(repository))?,
+                windows: windows(activities, periods, config, Some(source), Some(repository))?,
             });
         }
     }
     Ok(MetricsReport {
-        windows: windows(activities, through, config, None, None)?,
+        windows: windows(activities, periods, config, None, None)?,
         by_source,
         by_repository,
     })
@@ -261,37 +320,25 @@ pub fn calculate(
 
 fn windows(
     activities: &[Activity],
-    through: NaiveDate,
+    periods: &[Period],
     config: &MetricsConfig,
     source: Option<Source>,
     repository: Option<&str>,
-) -> Result<[WindowMetrics; 2], Box<dyn Error>> {
-    let window = |days| -> Result<WindowMetrics, Box<dyn Error>> {
-        let current_start = through
-            .checked_sub_days(Days::new(days - 1))
-            .ok_or("Date hors limites")?;
-        let previous_end = current_start.pred_opt().ok_or("Date hors limites")?;
-        let previous_start = previous_end
-            .checked_sub_days(Days::new(days - 1))
-            .ok_or("Date hors limites")?;
-        let current_period = Period {
-            from: current_start,
-            to: through,
-        };
-        let previous_period = Period {
-            from: previous_start,
-            to: previous_end,
-        };
-        let current = snapshot(activities, &current_period, config, source, repository)?;
-        let previous = snapshot(activities, &previous_period, config, source, repository)?;
-        Ok(WindowMetrics {
-            days,
-            current_period,
-            previous_period,
-            metrics: compare(current, previous),
+) -> Result<Vec<WindowMetrics>, Box<dyn Error>> {
+    periods
+        .iter()
+        .map(|period| {
+            let previous_period = period.previous()?;
+            let current = snapshot(activities, period, config, source, repository)?;
+            let previous = snapshot(activities, &previous_period, config, source, repository)?;
+            Ok(WindowMetrics {
+                days: period.days(),
+                current_period: period.clone(),
+                previous_period,
+                metrics: compare(current, previous),
+            })
         })
-    };
-    Ok([window(7)?, window(30)?])
+        .collect()
 }
 
 #[derive(Default)]
