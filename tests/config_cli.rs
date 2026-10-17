@@ -262,6 +262,198 @@ fn rewrite_restricts_existing_file_and_explicit_env_precedes_legacy() {
     assert_eq!(json(&output)["source"], "env");
 }
 
+#[cfg(unix)]
+#[test]
+fn interactive_token_input_is_not_echoed_to_the_terminal() {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mut command = Command::new("script");
+    #[cfg(target_os = "macos")]
+    command.args([
+        "-qF",
+        "/dev/null",
+        env!("CARGO_BIN_EXE_dev-metrics"),
+        "--config",
+        "config.toml",
+        "config",
+        "init",
+        "--bitbucket-username",
+        "alice",
+        "--bitbucket-token",
+        "fake-bitbucket-token",
+        "--bitbucket-workspace",
+        "team",
+        "--metrics-excluded-files",
+        "",
+    ]);
+    #[cfg(not(target_os = "macos"))]
+    command.args(["-q", "-f", "-c", &format!("{} --config config.toml config init --bitbucket-username alice --bitbucket-token fake-bitbucket-token --bitbucket-workspace team --metrics-excluded-files ''", env!("CARGO_BIN_EXE_dev-metrics")), "/dev/null"]);
+    let mut child = command
+        .current_dir(directory.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = child.stdout.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut captured = Vec::new();
+        let token_prompt = b"github.token (vide pour ignorer) : ";
+        let output_prompt = b"output_dir (vide pour ignorer) : ";
+        let mut announced = 0;
+        let mut byte = [0u8; 1];
+        while output.read(&mut byte).unwrap_or(0) == 1 {
+            captured.push(byte[0]);
+            if announced == 0 && captured.ends_with(token_prompt) {
+                sender.send(1).unwrap();
+                announced = 1;
+            } else if announced == 1 && captured.ends_with(output_prompt) {
+                sender.send(2).unwrap();
+                announced = 2;
+            }
+        }
+        captured
+    });
+    if receiver.recv_timeout(Duration::from_secs(5)) != Ok(1) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("prompt absent");
+    }
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(b"fake-github-secret\n").unwrap();
+    if receiver.recv_timeout(Duration::from_secs(5)) != Ok(2) {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("prompt suivant absent");
+    }
+    input.write_all(b"reports\n").unwrap();
+    let status = child.wait().unwrap();
+    drop(input);
+    let captured = reader.join().unwrap();
+    assert!(
+        status.success(),
+        "status={status} output={}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(
+        !String::from_utf8_lossy(&captured).contains("fake-github-secret"),
+        "{}",
+        String::from_utf8_lossy(&captured)
+    );
+    assert!(String::from_utf8_lossy(&captured).contains("reports"));
+    let path = directory.path().join("config.toml");
+    assert_eq!(
+        dev_metrics::config::Config::load(&path)
+            .unwrap()
+            .github
+            .unwrap()
+            .token
+            .as_deref(),
+        Some("fake-github-secret")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn writes_through_a_symlink_without_replacing_it() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("managed/config.toml");
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, "[bitbucket]\nworkspace='first'\n").unwrap();
+    let link = directory.path().join("config.toml");
+    symlink("managed/config.toml", &link).unwrap();
+    assert!(
+        run(&link, &["set", "bitbucket.workspace", "second"])
+            .status
+            .success()
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        dev_metrics::config::Config::load(&target)
+            .unwrap()
+            .bitbucket
+            .unwrap()
+            .workspace
+            .as_deref(),
+        Some("second")
+    );
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        run(&link, &["unset", "bitbucket.workspace"])
+            .status
+            .success()
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        dev_metrics::config::Config::load(&target)
+            .unwrap()
+            .bitbucket
+            .unwrap()
+            .workspace,
+        None
+    );
+    assert!(
+        run(
+            &link,
+            &[
+                "init",
+                "--non-interactive",
+                "--force",
+                "--bitbucket-workspace",
+                "third"
+            ]
+        )
+        .status
+        .success()
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        dev_metrics::config::Config::load(&target)
+            .unwrap()
+            .bitbucket
+            .unwrap()
+            .workspace
+            .as_deref(),
+        Some("third")
+    );
+
+    let dangling = directory.path().join("dangling.toml");
+    symlink("missing.toml", &dangling).unwrap();
+    let failure = run(&dangling, &["init", "--non-interactive", "--force"]);
+    assert_eq!(error(&failure)["code"], "CONFIGURATION_ERROR");
+    assert!(
+        std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!directory.path().join("missing.toml").exists());
+}
+
 #[test]
 fn get_rejects_invalid_value_already_in_file() {
     let directory = tempfile::tempdir().unwrap();

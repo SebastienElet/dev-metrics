@@ -312,7 +312,25 @@ fn save(path: &Path, table: &toml::Table, mode: SaveMode) -> Result<(), CommandE
     let source = toml::to_string_pretty(table)
         .map_err(|_| config_error("Configuration impossible à sérialiser"))?;
     Config::parse(&source).map_err(|_| config_error("Configuration produite invalide"))?;
-    let parent = path
+    let destination = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            std::fs::canonicalize(path).map_err(|_| {
+                config_error(format!(
+                    "Lien de configuration invalide : {}",
+                    path.display()
+                ))
+            })?
+        }
+        Ok(_) => path.to_path_buf(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(_) => {
+            return Err(config_error(format!(
+                "Impossible d'inspecter {}",
+                path.display()
+            )));
+        }
+    };
+    let parent = destination
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
@@ -332,17 +350,44 @@ fn save(path: &Path, table: &toml::Table, mode: SaveMode) -> Result<(), CommandE
         .write_all(source.as_bytes())
         .map_err(|_| config_error("Impossible d'écrire la configuration"))?;
     match mode {
-        SaveMode::CreateNew => temporary.persist_noclobber(path).map_err(|_| {
+        SaveMode::CreateNew => temporary.persist_noclobber(&destination).map_err(|_| {
             config_error("Configuration existante ; utilisez --force pour la remplacer")
         })?,
         SaveMode::Replace => temporary
-            .persist(path)
+            .persist(&destination)
             .map_err(|_| config_error("Impossible de remplacer la configuration"))?,
     };
     Ok(())
 }
 
 fn prompt(key: &str) -> Result<Option<String>, CommandError> {
+    #[cfg(unix)]
+    if key.ends_with(".token") && io::stdin().is_terminal() {
+        let echo = TerminalEcho::hide()
+            .map_err(|_| config_error("Impossible de protéger la saisie du secret"))?;
+        show_prompt(&format!("{key} (vide pour ignorer) : "))?;
+        let mut value = String::new();
+        let length = io::stdin()
+            .read_line(&mut value)
+            .map_err(|_| config_error("Impossible de lire le secret"))?;
+        drop(echo);
+        show_prompt("\n")?;
+        if length == 0 {
+            return Err(config_error("Entrée interactive indisponible"));
+        }
+        let value = value.trim_end_matches(['\r', '\n']);
+        return Ok((!value.is_empty()).then(|| value.to_owned()));
+    }
+    #[cfg(windows)]
+    if key.ends_with(".token") && io::stdin().is_terminal() {
+        let value = rpassword::prompt_password(format!("{key} (vide pour ignorer) : "))
+            .map_err(|_| config_error("Impossible de lire le secret"))?;
+        return Ok((!value.is_empty()).then_some(value));
+    }
+    #[cfg(not(any(unix, windows)))]
+    if key.ends_with(".token") && io::stdin().is_terminal() {
+        return Err(config_error("Saisie de secret sans écho indisponible"));
+    }
     show_prompt(&format!("{key} (vide pour ignorer) : "))?;
     let mut value = String::new();
     let length = io::stdin()
@@ -353,6 +398,42 @@ fn prompt(key: &str) -> Result<Option<String>, CommandError> {
     }
     let value = value.trim_end_matches(['\r', '\n']);
     Ok((!value.is_empty()).then(|| value.to_owned()))
+}
+
+#[cfg(unix)]
+struct TerminalEcho {
+    descriptor: std::os::fd::RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl TerminalEcho {
+    fn hide() -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let descriptor = io::stdin().as_raw_fd();
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        if unsafe { libc::tcgetattr(descriptor, original.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        if unsafe { libc::tcsetattr(descriptor, libc::TCSANOW, &hidden) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            descriptor,
+            original,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEcho {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(self.descriptor, libc::TCSANOW, &self.original) };
+    }
 }
 
 fn confirm_overwrite() -> Result<bool, CommandError> {
