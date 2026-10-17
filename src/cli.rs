@@ -1,12 +1,13 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+pub mod config;
 pub mod error;
 
 pub const EXIT_HELP: &str = "Sorties : succès sur stdout ; erreurs JSON {code,message,details} sur stderr.\nCodes de sortie : 0 succès/aide ; 1 écriture ; 2 arguments/période ; 3 configuration ; 4 authentification locale ; 5 collecte/calcul.\nAucun rapport partiel en cas d'échec de collecte ou de calcul.";
 
 #[derive(Debug, Parser)]
-#[command(name = "dev-metrics", version, about = "Métriques de développement pour un humain ou un bot LLM", after_help = format!("Exemples :\n  dev-metrics report\n  dev-metrics report --format table\n  dev-metrics report --since 2026-10-01 --until 2026-10-15 --format markdown\n  dev-metrics schema\n  dev-metrics github --help\n  dev-metrics bitbucket --help\n  dev-metrics --config ./config.toml report\n\n{EXIT_HELP}"))]
+#[command(name = "dev-metrics", version, about = "Métriques de développement pour un humain ou un bot LLM", after_help = format!("Exemples :\n  dev-metrics config init\n  dev-metrics report\n  dev-metrics report --format table\n  dev-metrics report --since 2026-10-01 --until 2026-10-15 --format markdown\n  dev-metrics schema\n  dev-metrics github --help\n  dev-metrics bitbucket --help\n  dev-metrics --config ./config.toml report\n\n{EXIT_HELP}"))]
 pub struct Cli {
     #[arg(
         long,
@@ -21,6 +22,11 @@ pub struct Cli {
 
 #[derive(Debug, PartialEq, Subcommand)]
 pub enum Command {
+    #[command(about = "Créer, lire et modifier la configuration", after_help = format!("Exemples :\n  dev-metrics config init\n  dev-metrics config init --non-interactive --github-token TOKEN --bitbucket-workspace team\n  dev-metrics config set bitbucket.workspace team\n  dev-metrics config get github.token --format json\n  dev-metrics config list --format json\n  dev-metrics config path\n\n{EXIT_HELP}"))]
+    Config {
+        #[command(subcommand)]
+        action: config::ConfigAction,
+    },
     #[command(about = "Collecter l'activité brute GitHub, contrat activity v1", after_help = format!("Exemples :\n  dev-metrics github --from 2026-10-01 --to 2026-10-07\n  dev-metrics github --since 2026-10-01 --until 2026-10-07 --user octocat --format table\n  dev-metrics github --from 2026-10-01 --to 2026-10-07 --format json --config ./config.toml\n\n{EXIT_HELP}"))]
     Github {
         #[arg(
@@ -73,7 +79,7 @@ pub enum Command {
         workspace: Option<String>,
         #[arg(
             long,
-            help = "UUID Bitbucket ou Account ID Atlassian (défaut : compte authentifié). Exemple : --user '{uuid}'"
+            help = "UUID Bitbucket ou Account ID Atlassian (défaut : identité configurée, puis compte authentifié). Exemple : --user '{uuid}'"
         )]
         user: Option<String>,
         #[arg(
@@ -113,7 +119,7 @@ pub enum Command {
         github_user: Option<String>,
         #[arg(
             long,
-            help = "UUID/Account ID Bitbucket (défaut : compte authentifié). Exemple : --bitbucket-user '{uuid}'"
+            help = "UUID/Account ID Bitbucket (défaut : identité configurée, puis compte authentifié). Exemple : --bitbucket-user '{uuid}'"
         )]
         bitbucket_user: Option<String>,
         #[arg(

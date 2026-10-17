@@ -5,7 +5,7 @@ use clap::{Parser, error::ErrorKind};
 use cli::error::{CommandError, ErrorCode};
 use cli::{ActivityFormat, Cli, Command, ReportFormat, SourceKind};
 use dev_metrics::activity::{ActivitySource, Period};
-use dev_metrics::config::{Config, config_path};
+use dev_metrics::config::{Config, config_path, validate_setting};
 use dev_metrics::metrics::REPORT_SCHEMA;
 use std::io::Write;
 use std::process::ExitCode;
@@ -56,6 +56,11 @@ fn run(
     if cli.command == Command::Schema {
         return Ok(REPORT_SCHEMA.into());
     }
+    if let Command::Config { action } = cli.command {
+        let path = config_path(cli.config, std::env::var_os("HOME"))
+            .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
+        return cli::config::run(action, &path);
+    }
     let invalid_period = |error| CommandError::new(ErrorCode::InvalidPeriod, error);
     let period = match &cli.command {
         Command::Github { from, to, .. } | Command::Bitbucket { from, to, .. } => {
@@ -96,12 +101,34 @@ fn run(
             }
             period
         }
-        Command::Schema => unreachable!(),
+        Command::Schema | Command::Config { .. } => unreachable!(),
     };
     let path = config_path(cli.config, std::env::var_os("HOME"))
         .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
-    let config = Config::load(&path)
+    let mut config = Config::load(&path)
         .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
+    let config_error = |error| CommandError::new(ErrorCode::ConfigurationError, error);
+    match &cli.command {
+        Command::Github { .. } => config.apply_github_environment().map_err(config_error)?,
+        Command::Bitbucket { user, .. } => config
+            .apply_bitbucket_environment(user.as_deref())
+            .map_err(config_error)?,
+        Command::Report {
+            source,
+            bitbucket_user,
+            ..
+        } => {
+            if source.contains(&SourceKind::Github) {
+                config.apply_github_environment().map_err(config_error)?;
+            }
+            if source.contains(&SourceKind::Bitbucket) {
+                config
+                    .apply_bitbucket_environment(bitbucket_user.as_deref())
+                    .map_err(config_error)?;
+            }
+        }
+        Command::Config { .. } | Command::Schema => unreachable!(),
+    }
     let (kind, user, workspace, format) = match cli.command {
         Command::Github { user, format, .. } => (SourceKind::Github, user, None, format),
         Command::Bitbucket {
@@ -123,6 +150,12 @@ fn run(
                 .into_iter()
                 .filter(|kind| source.contains(kind))
                 .collect::<Vec<_>>();
+            let configured_bitbucket_user =
+                if selected.contains(&SourceKind::Bitbucket) && bitbucket_user.is_none() {
+                    configured_bitbucket_username(&config)?
+                } else {
+                    None
+                };
             let sources = selected
                 .iter()
                 .map(|kind| source_factory(*kind, &config, workspace.as_deref()))
@@ -134,7 +167,9 @@ fn run(
                     source: source.as_ref(),
                     user: match kind {
                         SourceKind::Github => github_user.as_deref(),
-                        SourceKind::Bitbucket => bitbucket_user.as_deref(),
+                        SourceKind::Bitbucket => {
+                            bitbucket_user.as_deref().or(configured_bitbucket_user)
+                        }
                     },
                 })
                 .collect::<Vec<_>>();
@@ -155,11 +190,16 @@ fn run(
                 ReportFormat::Markdown => Ok(report.markdown()),
             };
         }
-        Command::Schema => unreachable!(),
+        Command::Schema | Command::Config { .. } => unreachable!(),
+    };
+    let configured_user = if kind == SourceKind::Bitbucket && user.is_none() {
+        configured_bitbucket_username(&config)?
+    } else {
+        None
     };
     let source = source_factory(kind, &config, workspace.as_deref())?;
     let activity = source
-        .collect_activity(user.as_deref(), period)
+        .collect_activity(user.as_deref().or(configured_user), period)
         .map_err(|error| {
             CommandError::new(ErrorCode::CollectionError, error).source(kind.as_str())
         })?;
@@ -170,13 +210,26 @@ fn run(
     }
 }
 
+fn configured_bitbucket_username(config: &Config) -> Result<Option<&str>, CommandError> {
+    let username = config
+        .bitbucket
+        .as_ref()
+        .and_then(|bitbucket| bitbucket.username.as_deref());
+    if let Some(username) = username {
+        validate_setting("bitbucket.username", username)
+            .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
+    }
+    Ok(username)
+}
+
 fn load_source(
     kind: SourceKind,
     config: &Config,
     workspace: Option<&str>,
 ) -> Result<Box<dyn ActivitySource>, CommandError> {
-    let auth_error =
-        |error| CommandError::new(ErrorCode::AuthenticationError, error).source(kind.as_str());
+    let auth_error = |error: Box<dyn std::error::Error>| {
+        CommandError::new(ErrorCode::AuthenticationError, error).source(kind.as_str())
+    };
     match kind {
         SourceKind::Github => {
             let configured = config
@@ -202,7 +255,8 @@ fn load_source(
                 CommandError::new(ErrorCode::ConfigurationError, error).source("bitbucket")
             })?;
             let token = dev_metrics::bitbucket::resolve_token(
-                std::env::var_os("BITBUCKET_TOKEN"),
+                std::env::var_os("DEV_METRICS_BITBUCKET_TOKEN")
+                    .or_else(|| std::env::var_os("BITBUCKET_TOKEN")),
                 configured.and_then(|config| config.token.as_deref()),
             )
             .map_err(auth_error)?;

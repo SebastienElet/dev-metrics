@@ -15,7 +15,7 @@ cargo install --git https://github.com/SebastienElet/dev-metrics
 
 ## Configuration
 
-Créez `~/.config/dev-metrics/config.toml` en remplaçant les valeurs d'exemple :
+Exécutez `dev-metrics config init` ou créez `~/.config/dev-metrics/config.toml` en remplaçant les valeurs d'exemple :
 
 ```toml
 [github]

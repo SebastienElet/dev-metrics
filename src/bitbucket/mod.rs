@@ -41,14 +41,7 @@ impl BitbucketSource {
     }
 
     pub fn activity(&self, user: Option<&str>, period: Period) -> Result<Activity, Box<dyn Error>> {
-        if user.is_some_and(|value| {
-            value.is_empty()
-                || matches!(value, "." | "..")
-                || !value.bytes().all(|c| {
-                    c.is_ascii_alphanumeric()
-                        || matches!(c, b'-' | b'_' | b'.' | b'{' | b'}' | b':')
-                })
-        }) {
+        if user.is_some_and(|value| !valid_user_identifier(value)) {
             return Err("Utilisateur Bitbucket invalide".into());
         }
         let endpoint = user.map_or_else(|| "user".into(), |user| format!("users/{user}"));
@@ -314,6 +307,14 @@ impl BitbucketSource {
         }
         Ok((files, additions, deletions))
     }
+}
+
+pub(crate) fn valid_user_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && !matches!(value, "." | "..")
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'{' | b'}' | b':')
+        })
 }
 
 fn validate_workspace(workspace: &str) -> Result<(), Box<dyn Error>> {

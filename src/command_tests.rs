@@ -173,6 +173,167 @@ fn report_collects_each_source_once_and_compares_the_custom_period() {
 }
 
 #[test]
+fn bitbucket_collection_uses_configured_username_unless_cli_user_is_explicit() {
+    for (arguments, expected) in [
+        (
+            vec!["bitbucket", "--from", "2026-10-01", "--to", "2026-10-30"],
+            "configured-user",
+        ),
+        (
+            vec![
+                "bitbucket",
+                "--from",
+                "2026-10-01",
+                "--to",
+                "2026-10-30",
+                "--user",
+                "explicit-user",
+            ],
+            "explicit-user",
+        ),
+    ] {
+        let (_directory, cli) = cli(&arguments, "[bitbucket]\nusername='configured-user'\n");
+        let output = run(cli, today(), |source, _, _| {
+            Ok(Box::new(FixedSource {
+                user: Some(if expected == "configured-user" {
+                    "configured-user"
+                } else {
+                    "explicit-user"
+                }),
+                collection_from: "2026-10-01",
+                ..fixed(source)
+            }))
+        });
+        assert!(output.is_ok(), "{output:?}");
+    }
+    let (_directory, cli) = cli(
+        &[
+            "report",
+            "--source",
+            "bitbucket",
+            "--since",
+            "2026-10-28",
+            "--until",
+            "2026-10-30",
+        ],
+        "[bitbucket]\nusername='configured-user'\n",
+    );
+    let output = run(cli, today(), |source, _, _| {
+        Ok(Box::new(FixedSource {
+            user: Some("configured-user"),
+            collection_from: "2026-10-25",
+            ..fixed(source)
+        }))
+    });
+    assert!(output.is_ok(), "{output:?}");
+}
+
+#[test]
+fn invalid_configured_bitbucket_username_fails_before_source_creation() {
+    let (_directory, cli) = cli(
+        &["bitbucket", "--from", "2026-10-01", "--to", "2026-10-30"],
+        "[bitbucket]\nusername='bad/path'\n",
+    );
+    let error = run(cli, today(), |_, _, _| {
+        panic!("source should not be created")
+    })
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 3);
+    assert_eq!(
+        serde_json::to_value(error).unwrap()["code"],
+        "CONFIGURATION_ERROR"
+    );
+}
+
+#[test]
+fn bitbucket_environment_username_reaches_collection() {
+    if std::env::var_os("DEV_METRICS_TEST_USERNAME_CHILD").is_some() {
+        let (_directory, cli) = cli(
+            &["bitbucket", "--from", "2026-10-01", "--to", "2026-10-30"],
+            "[bitbucket]\nusername='file-user'\n",
+        );
+        let result = run(cli, today(), |source, config, _| {
+            assert_eq!(
+                config.bitbucket.as_ref().unwrap().username.as_deref(),
+                Some("env-user")
+            );
+            Ok(Box::new(FixedSource {
+                user: Some("env-user"),
+                collection_from: "2026-10-01",
+                ..fixed(source)
+            }))
+        });
+        assert!(result.is_ok(), "{result:?}");
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "command_tests::bitbucket_environment_username_reaches_collection",
+        ])
+        .env("DEV_METRICS_TEST_USERNAME_CHILD", "1")
+        .env("DEV_METRICS_BITBUCKET_USERNAME", "env-user")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
+fn explicit_bitbucket_user_overrides_invalid_environment_username() {
+    if std::env::var_os("DEV_METRICS_TEST_EXPLICIT_USER_CHILD").is_some() {
+        for (arguments, collection_from) in [
+            (
+                vec![
+                    "bitbucket",
+                    "--from",
+                    "2026-10-01",
+                    "--to",
+                    "2026-10-30",
+                    "--user",
+                    "explicit-user",
+                ],
+                "2026-10-01",
+            ),
+            (
+                vec![
+                    "report",
+                    "--source",
+                    "bitbucket",
+                    "--since",
+                    "2026-10-28",
+                    "--until",
+                    "2026-10-30",
+                    "--bitbucket-user",
+                    "explicit-user",
+                ],
+                "2026-10-25",
+            ),
+        ] {
+            let (_directory, cli) = cli(&arguments, "[bitbucket]\nusername='file-user'\n");
+            let result = run(cli, today(), |source, _, _| {
+                Ok(Box::new(FixedSource {
+                    user: Some("explicit-user"),
+                    collection_from,
+                    ..fixed(source)
+                }))
+            });
+            assert!(result.is_ok(), "{result:?}");
+        }
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "command_tests::explicit_bitbucket_user_overrides_invalid_environment_username",
+        ])
+        .env("DEV_METRICS_TEST_EXPLICIT_USER_CHILD", "1")
+        .env("DEV_METRICS_BITBUCKET_USERNAME", "bad/path")
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+#[test]
 fn report_selects_human_formats_and_honors_an_explicit_end_date() {
     for (format, expected) in [
         ("table", "Ensemble\n7 j :"),
