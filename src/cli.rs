@@ -79,7 +79,7 @@ pub enum Command {
         workspace: Option<String>,
         #[arg(
             long,
-            help = "UUID Bitbucket ou Account ID Atlassian (défaut : compte authentifié). Exemple : --user '{uuid}'"
+            help = "UUID Bitbucket ou Account ID Atlassian (défaut : identité configurée, puis compte authentifié). Exemple : --user '{uuid}'"
         )]
         user: Option<String>,
         #[arg(
@@ -119,7 +119,7 @@ pub enum Command {
         github_user: Option<String>,
         #[arg(
             long,
-            help = "UUID/Account ID Bitbucket (défaut : compte authentifié). Exemple : --bitbucket-user '{uuid}'"
+            help = "UUID/Account ID Bitbucket (défaut : identité configurée, puis compte authentifié). Exemple : --bitbucket-user '{uuid}'"
         )]
         bitbucket_user: Option<String>,
         #[arg(

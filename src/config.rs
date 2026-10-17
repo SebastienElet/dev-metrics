@@ -69,12 +69,18 @@ impl Config {
         Ok(())
     }
 
-    pub fn apply_bitbucket_environment(&mut self) -> Result<(), String> {
+    pub fn apply_bitbucket_environment(
+        &mut self,
+        explicit_user: Option<&str>,
+    ) -> Result<(), String> {
         for key in [
             "bitbucket.username",
             "bitbucket.token",
             "bitbucket.workspace",
         ] {
+            if key == "bitbucket.username" && explicit_user.is_some() {
+                continue;
+            }
             if key == "bitbucket.token" && std::env::var_os("DEV_METRICS_BITBUCKET_TOKEN").is_none()
             {
                 continue;
@@ -151,7 +157,7 @@ pub fn validate_setting(key: &str, value: &str) -> Result<(), String> {
         "github.token" | "bitbucket.token" => {
             !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_graphic())
         }
-        "bitbucket.username" => !value.trim().is_empty() && !value.chars().any(char::is_control),
+        "bitbucket.username" => crate::bitbucket::valid_user_identifier(value),
         "bitbucket.workspace" => {
             !value.is_empty()
                 && value
@@ -300,6 +306,7 @@ mod tests {
         for (key, value) in [
             ("github.token", "bad token"),
             ("bitbucket.workspace", "bad/path"),
+            ("bitbucket.username", "bad/path"),
             ("bitbucket.username", ""),
             ("metrics.excluded_files", "*.snap,,generated/*"),
             ("output_dir", ""),
