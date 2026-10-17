@@ -7,6 +7,7 @@ use crate::activity::{
     Activity, ActivitySource, Comment, CommentKind, Commit, FileChange, Period, PullRequest,
     Review, ReviewState, Source,
 };
+use crate::progress::{Event as ProgressEvent, Progress};
 use chrono::{DateTime, Utc};
 use model::{
     CommentDetail, CommitDetail, DiffStat, Event, PullRequestDetail, PullRequestState, Repository,
@@ -32,6 +33,11 @@ impl ActivitySource for BitbucketSource {
 }
 
 impl BitbucketSource {
+    pub fn with_progress(mut self, progress: Progress) -> Self {
+        self.api.progress = progress;
+        self
+    }
+
     pub fn new(api_base: Url, token: &str, workspace: &str) -> Result<Self, Box<dyn Error>> {
         validate_workspace(workspace)?;
         Ok(Self {
@@ -54,6 +60,9 @@ impl BitbucketSource {
     }
 
     pub fn activity(&self, user: Option<&str>, period: Period) -> Result<Activity, Box<dyn Error>> {
+        self.api
+            .progress
+            .emit(ProgressEvent::Source(Source::Bitbucket));
         if user.is_some_and(|value| !valid_user_identifier(value)) {
             return Err("Utilisateur Bitbucket invalide".into());
         }
@@ -64,10 +73,17 @@ impl BitbucketSource {
         }
         let mut activity = Activity::empty(Source::Bitbucket, &identity.uuid, period);
         let mut repositories = BTreeSet::new();
-        for repository in self
+        let discovered = self
             .api
-            .list::<Repository>(&format!("repositories/{}", self.workspace), &[])?
-        {
+            .list::<Repository>(&format!("repositories/{}", self.workspace), &[])?;
+        let total = discovered.len();
+        self.api.progress.emit(ProgressEvent::Repositories {
+            source: Source::Bitbucket,
+            stage: "découverte",
+            current: 0,
+            total,
+        });
+        for (index, repository) in discovered.into_iter().enumerate() {
             let Some((workspace, slug)) = repository.full_name.split_once('/') else {
                 return Err("Dépôt Bitbucket invalide".into());
             };
@@ -84,6 +100,12 @@ impl BitbucketSource {
                 return Err("Dépôt Bitbucket dupliqué".into());
             }
             let endpoint = format!("repositories/{}", repository.full_name);
+            self.api.progress.emit(ProgressEvent::Repositories {
+                source: Source::Bitbucket,
+                stage: "PRs",
+                current: index + 1,
+                total,
+            });
             let mut pull_requests = BTreeSet::new();
             for detail in self.api.list::<PullRequestDetail>(
                 &format!("{endpoint}/pullrequests"),
@@ -100,6 +122,12 @@ impl BitbucketSource {
                 self.pull_request(&mut activity, &repository.full_name, detail)?;
             }
             let mut commits = BTreeSet::new();
+            self.api.progress.emit(ProgressEvent::Repositories {
+                source: Source::Bitbucket,
+                stage: "commits",
+                current: index + 1,
+                total,
+            });
             for commit in self
                 .api
                 .list::<CommitDetail>(&format!("{endpoint}/commits"), &[])?

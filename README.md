@@ -56,3 +56,5 @@ dev-metrics schema
 Pour les autres options et les commandes d'activité brute, consultez
 `dev-metrics --help` puis l'aide de chaque commande. `dev-metrics schema` affiche
 le schéma JSON du rapport pour les intégrations et les agents.
+
+`--quiet` désactive la progression ; `--verbose` détaille les appels API sur stderr, uniquement dans un terminal (`--quiet` prioritaire).

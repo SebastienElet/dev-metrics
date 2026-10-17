@@ -1,3 +1,5 @@
+use crate::activity::Source;
+use crate::progress::{Event, Progress};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Url, redirect, retry};
@@ -11,6 +13,7 @@ pub(super) struct Api {
     client: Client,
     token: String,
     email: Option<String>,
+    pub progress: Progress,
 }
 
 impl Api {
@@ -57,6 +60,7 @@ impl Api {
             client,
             token: token.into(),
             email: email.map(str::to_owned),
+            progress: Progress::default(),
         })
     }
 
@@ -73,23 +77,34 @@ impl Api {
     }
 
     pub fn get<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T, Box<dyn Error>> {
-        let (body, _) = self.request(self.base.join(endpoint)?)?;
+        let (body, _) = self.request(self.base.join(endpoint)?, operation(endpoint))?;
         Ok(body)
     }
 
-    fn request<T: DeserializeOwned>(&self, mut url: Url) -> Result<(T, Url), Box<dyn Error>> {
+    fn request<T: DeserializeOwned>(
+        &self,
+        mut url: Url,
+        operation: &'static str,
+    ) -> Result<(T, Url), Box<dyn Error>> {
         let mut visited = BTreeSet::new();
         for _ in 0..=5 {
             url = self.checked_url(url)?;
             if !visited.insert(url.to_string()) {
                 return Err("Redirection Bitbucket cyclique".into());
             }
-            let request = self.client.get(url.clone());
-            let request = match &self.email {
-                Some(email) => request.basic_auth(email, Some(&self.token)),
-                None => request.bearer_auth(&self.token),
-            };
-            let response = request.send().map_err(|error| {
+            let response = crate::http::get(
+                || {
+                    let request = self.client.get(url.clone());
+                    match &self.email {
+                        Some(email) => request.basic_auth(email, Some(&self.token)),
+                        None => request.bearer_auth(&self.token),
+                    }
+                },
+                Source::Bitbucket,
+                operation,
+                &self.progress,
+            )
+            .map_err(|error| {
                 if error.is_timeout() {
                     "Bitbucket : timeout"
                 } else {
@@ -135,11 +150,18 @@ impl Api {
         let mut visited = BTreeSet::new();
         let mut expected_size = None;
         let mut items = Vec::new();
+        let mut number = 1;
+        let operation = operation(endpoint);
         loop {
             if !visited.insert(url.to_string()) {
                 return Err("Pagination Bitbucket cyclique".into());
             }
-            let (page, effective): (Page<T>, _) = self.request(url)?;
+            self.progress.emit(Event::Page {
+                source: Source::Bitbucket,
+                operation,
+                number,
+            });
+            let (page, effective): (Page<T>, _) = self.request(url, operation)?;
             if let Some(size) = page.size {
                 if expected_size.is_some_and(|previous| previous != size) {
                     return Err("Taille Bitbucket modifiée pendant la pagination".into());
@@ -155,6 +177,7 @@ impl Api {
             }
             match page.next {
                 Some(next) => {
+                    number += 1;
                     url = self.checked_url(
                         effective
                             .join(&next)
@@ -169,6 +192,20 @@ impl Api {
                 }
             }
         }
+    }
+}
+
+fn operation(endpoint: &str) -> &'static str {
+    match endpoint.split('/').collect::<Vec<_>>().as_slice() {
+        ["user"] | ["users", _] => "identité",
+        ["repositories", _] => "dépôts",
+        ["repositories", _, _, "pullrequests"] => "PRs",
+        ["repositories", _, _, "commits"] => "commits",
+        ["repositories", _, _, "pullrequests", _, "activity"] => "activité PR",
+        ["repositories", _, _, "pullrequests", _, "comments"] => "commentaires",
+        ["repositories", _, _, "pullrequests", _, "diffstat"]
+        | ["repositories", _, _, "diffstat", _] => "fichiers",
+        _ => "ressource",
     }
 }
 
