@@ -1,4 +1,5 @@
-use crate::activity::ReviewState;
+use crate::activity::{ReviewState, Source};
+use crate::progress::{Event, Progress};
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK};
@@ -10,6 +11,7 @@ use std::time::Duration;
 pub(super) struct Api {
     base: Url,
     client: Client,
+    pub progress: Progress,
 }
 
 impl Api {
@@ -35,7 +37,11 @@ impl Api {
             .redirect(redirect::Policy::none())
             .retry(retry::never())
             .build()?;
-        Ok(Self { base, client })
+        Ok(Self {
+            base,
+            client,
+            progress: Progress::default(),
+        })
     }
 
     pub fn get<T: DeserializeOwned>(
@@ -43,8 +49,40 @@ impl Api {
         endpoint: &str,
         query: &[(&str, String)],
     ) -> Result<(T, bool), Box<dyn Error>> {
-        let url = self.base.join(endpoint)?;
-        let response = self.client.get(url).query(query).send().map_err(|error| {
+        let mut url = self.base.join(endpoint)?;
+        if !query.is_empty() {
+            url.query_pairs_mut()
+                .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
+        }
+        let operation = match endpoint.split('/').collect::<Vec<_>>().as_slice() {
+            ["user"] => "identité",
+            ["search", "issues"] => "recherche PRs et commentaires",
+            ["search", "commits"] => "recherche commits",
+            ["repos", _, _, "pulls", _] => "PR",
+            ["repos", _, _, "commits", _] => "commit et fichiers",
+            ["repos", _, _, _, _, "comments"] => "commentaires",
+            ["repos", _, _, _, _, "reviews"] => "reviews",
+            ["repos", _, _, _, _, "files"] => "fichiers",
+            _ => "ressource",
+        };
+        if let Some(number) = query
+            .iter()
+            .find(|(key, _)| *key == "page")
+            .and_then(|(_, value)| value.parse().ok())
+        {
+            self.progress.emit(Event::Page {
+                source: Source::GitHub,
+                operation,
+                number,
+            });
+        }
+        let response = crate::http::get(
+            || self.client.get(url.clone()),
+            Source::GitHub,
+            operation,
+            &self.progress,
+        )
+        .map_err(|error| {
             let reason = if error.is_timeout() {
                 "timeout"
             } else {

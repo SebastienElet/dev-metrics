@@ -2,6 +2,7 @@ mod output;
 pub use output::REPORT_SCHEMA;
 
 use crate::activity::{Activity, ActivitySource, ActivityWarning, FileChange, Period, Source};
+use crate::progress::{Event, Progress};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -100,11 +101,21 @@ pub fn collect_period(
     period: Period,
     config: &MetricsConfig,
 ) -> Result<MetricsReport, Box<dyn Error>> {
+    collect_period_with_progress(sources, period, config, &Progress::default())
+}
+
+pub fn collect_period_with_progress(
+    sources: &[SourceRequest<'_>],
+    period: Period,
+    config: &MetricsConfig,
+    progress: &Progress,
+) -> Result<MetricsReport, Box<dyn Error>> {
     let collection_period = Period {
         from: period.previous()?.from,
         to: period.to,
     };
     let activities = collect_activities(sources, collection_period)?;
+    progress.emit(Event::Calculating);
     calculate_period(&activities, period, config)
 }
 
@@ -113,11 +124,21 @@ pub fn collect(
     through: NaiveDate,
     config: &MetricsConfig,
 ) -> Result<MetricsReport, Box<dyn Error>> {
+    collect_with_progress(sources, through, config, &Progress::default())
+}
+
+pub fn collect_with_progress(
+    sources: &[SourceRequest<'_>],
+    through: NaiveDate,
+    config: &MetricsConfig,
+    progress: &Progress,
+) -> Result<MetricsReport, Box<dyn Error>> {
     let from = through
         .checked_sub_days(Days::new(59))
         .ok_or("Date hors limites")?;
     let period = Period { from, to: through };
     let activities = collect_activities(sources, period)?;
+    progress.emit(Event::Calculating);
     calculate(&activities, through, config)
 }
 

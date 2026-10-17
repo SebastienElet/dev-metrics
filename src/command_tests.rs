@@ -105,11 +105,16 @@ fn report_defaults_to_compact_json_and_rolling_windows_using_configured_exclusio
             ..
         }
     ));
-    let output = run(cli, today(), |source, _, workspace| {
-        assert_eq!(source, SourceKind::Github);
-        assert_eq!(workspace, None);
-        Ok(Box::new(fixed(source)))
-    })
+    let output = run(
+        &Progress::default(),
+        cli,
+        today(),
+        |source, _, workspace| {
+            assert_eq!(source, SourceKind::Github);
+            assert_eq!(workspace, None);
+            Ok(Box::new(fixed(source)))
+        },
+    )
     .unwrap();
     let mut stdout = Vec::new();
     write_output(&mut stdout, &output).unwrap();
@@ -150,19 +155,24 @@ fn report_collects_each_source_once_and_compares_the_custom_period() {
         "output_dir='unused'",
     );
     let mut requested = vec![];
-    let output = run(cli, today(), |source, _, workspace| {
-        requested.push(source);
-        assert_eq!(workspace, Some("team"));
-        Ok(Box::new(FixedSource {
-            user: Some(if source == SourceKind::Github {
-                "alice"
-            } else {
-                "{alice}"
-            }),
-            collection_from: "2026-10-25",
-            ..fixed(source)
-        }))
-    })
+    let output = run(
+        &Progress::default(),
+        cli,
+        today(),
+        |source, _, workspace| {
+            requested.push(source);
+            assert_eq!(workspace, Some("team"));
+            Ok(Box::new(FixedSource {
+                user: Some(if source == SourceKind::Github {
+                    "alice"
+                } else {
+                    "{alice}"
+                }),
+                collection_from: "2026-10-25",
+                ..fixed(source)
+            }))
+        },
+    )
     .unwrap();
     assert_eq!(requested, [SourceKind::Github, SourceKind::Bitbucket]);
     let value: Value = serde_json::from_str(&output).unwrap();
@@ -194,7 +204,7 @@ fn bitbucket_collection_uses_configured_username_unless_cli_user_is_explicit() {
         ),
     ] {
         let (_directory, cli) = cli(&arguments, "[bitbucket]\nusername='configured-user'\n");
-        let output = run(cli, today(), |source, _, _| {
+        let output = run(&Progress::default(), cli, today(), |source, _, _| {
             Ok(Box::new(FixedSource {
                 user: Some(if expected == "configured-user" {
                     "configured-user"
@@ -219,7 +229,7 @@ fn bitbucket_collection_uses_configured_username_unless_cli_user_is_explicit() {
         ],
         "[bitbucket]\nusername='configured-user'\n",
     );
-    let output = run(cli, today(), |source, _, _| {
+    let output = run(&Progress::default(), cli, today(), |source, _, _| {
         Ok(Box::new(FixedSource {
             user: Some("configured-user"),
             collection_from: "2026-10-25",
@@ -235,7 +245,7 @@ fn invalid_configured_bitbucket_username_fails_before_source_creation() {
         &["bitbucket", "--from", "2026-10-01", "--to", "2026-10-30"],
         "[bitbucket]\nusername='bad/path'\n",
     );
-    let error = run(cli, today(), |_, _, _| {
+    let error = run(&Progress::default(), cli, today(), |_, _, _| {
         panic!("source should not be created")
     })
     .unwrap_err();
@@ -253,7 +263,7 @@ fn bitbucket_environment_username_reaches_collection() {
             &["bitbucket", "--from", "2026-10-01", "--to", "2026-10-30"],
             "[bitbucket]\nusername='file-user'\n",
         );
-        let result = run(cli, today(), |source, config, _| {
+        let result = run(&Progress::default(), cli, today(), |source, config, _| {
             assert_eq!(
                 config.bitbucket.as_ref().unwrap().username.as_deref(),
                 Some("env-user")
@@ -311,7 +321,7 @@ fn explicit_bitbucket_user_overrides_invalid_environment_username() {
             ),
         ] {
             let (_directory, cli) = cli(&arguments, "[bitbucket]\nusername='file-user'\n");
-            let result = run(cli, today(), |source, _, _| {
+            let result = run(&Progress::default(), cli, today(), |source, _, _| {
                 Ok(Box::new(FixedSource {
                     user: Some("explicit-user"),
                     collection_from,
@@ -344,9 +354,12 @@ fn report_selects_human_formats_and_honors_an_explicit_end_date() {
             &["report", "--until", "2026-10-30", "--format", format],
             "output_dir='unused'",
         );
-        let output = run(cli, "2027-01-01".parse().unwrap(), |source, _, _| {
-            Ok(Box::new(fixed(source)))
-        })
+        let output = run(
+            &Progress::default(),
+            cli,
+            "2027-01-01".parse().unwrap(),
+            |source, _, _| Ok(Box::new(fixed(source))),
+        )
         .unwrap();
         assert!(output.starts_with(expected), "{output}");
         assert!(output.contains("2026-10-24 → 2026-10-30"));
@@ -360,7 +373,7 @@ fn report_errors_propagate_without_a_partial_result() {
             &["report", "--source", "github,bitbucket"],
             "output_dir='unused'",
         );
-        let error = run(cli, today(), |source, _, _| {
+        let error = run(&Progress::default(), cli, today(), |source, _, _| {
             Ok(Box::new(FixedSource {
                 failure: source == SourceKind::Bitbucket && failure,
                 overflow: source == SourceKind::Bitbucket && overflow,
@@ -381,7 +394,7 @@ fn raw_activity_json_is_compact_and_preserves_its_contract() {
         &["github", "--since", "2026-10-01", "--until", "2026-10-30"],
         "output_dir='unused'",
     );
-    let output = run(cli, today(), |source, _, _| {
+    let output = run(&Progress::default(), cli, today(), |source, _, _| {
         Ok(Box::new(FixedSource {
             collection_from: "2026-10-01",
             ..fixed(source)
@@ -420,7 +433,7 @@ fn raw_collection_failure_has_source_details_and_exit_five() {
         &["github", "--from", "2026-09-01", "--to", "2026-10-30"],
         "",
     );
-    let error = run(cli, today(), |source, _, _| {
+    let error = run(&Progress::default(), cli, today(), |source, _, _| {
         Ok(Box::new(FixedSource {
             failure: true,
             ..fixed(source)
@@ -439,7 +452,7 @@ fn raw_collection_failure_has_source_details_and_exit_five() {
 #[test]
 fn custom_period_defaults_to_today_and_schema_command_validates_its_output() {
     let (_directory, cli) = cli(&["report", "--since", "2026-10-28"], "");
-    let output = run(cli, today(), |source, _, _| {
+    let output = run(&Progress::default(), cli, today(), |source, _, _| {
         Ok(Box::new(FixedSource {
             collection_from: "2026-10-25",
             ..fixed(source)
@@ -449,6 +462,7 @@ fn custom_period_defaults_to_today_and_schema_command_validates_its_output() {
     let value: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["windows"][0]["current_period"]["to"], "2026-10-30");
     let schema = run(
+        &Progress::default(),
         Cli::try_parse_from(["dev-metrics", "schema"]).unwrap(),
         today(),
         |_, _, _| panic!("schema ne collecte rien"),
@@ -493,6 +507,7 @@ fn warnings_reach_json_or_stderr_without_polluting_table_and_markdown() {
         let (_directory, cli) = cli(&["report", "--format", format], "");
         let mut stderr = Vec::new();
         let stdout = run_with_warnings(
+            &Progress::default(),
             cli,
             today(),
             |_, _, _| Ok(Box::new(WarningSource)),
@@ -518,6 +533,7 @@ fn warnings_reach_json_or_stderr_without_polluting_table_and_markdown() {
 fn warning_write_failures_remain_output_errors() {
     let (_directory, cli) = cli(&["report", "--format", "table"], "");
     let error = run_with_warnings(
+        &Progress::default(),
         cli,
         today(),
         |_, _, _| Ok(Box::new(WarningSource)),
@@ -543,6 +559,7 @@ fn raw_activity_table_emits_warnings_on_stderr() {
     );
     let mut stderr = Vec::new();
     let output = run_with_warnings(
+        &Progress::default(),
         cli,
         today(),
         |_, _, _| Ok(Box::new(WarningSource)),
@@ -554,4 +571,126 @@ fn raw_activity_table_emits_warnings_on_stderr() {
     let warning: Value = serde_json::from_slice(&stderr).unwrap();
     assert_eq!(warning["repository"], "team/project");
     assert_eq!(warning["subject"], json!({"kind":"commit","sha":"abc123"}));
+}
+
+#[test]
+fn report_progress_preserves_stdout_for_every_output_mode() {
+    for format in ["json", "table", "markdown"] {
+        let mut baseline = None;
+        for (terminal, quiet, verbose) in [
+            (false, false, false),
+            (true, false, false),
+            (true, false, true),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let (_directory, arguments) = cli(&["report", "--format", format], "");
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let progress = Progress::new(log.reopen().unwrap(), terminal, quiet, verbose);
+            let output = run(&progress, arguments, today(), |kind, _, _| {
+                Ok(Box::new(fixed(kind)))
+            })
+            .unwrap();
+            let mut stdout = Vec::new();
+            write_output(&mut stdout, &output).unwrap();
+            if let Some(expected) = &baseline {
+                assert_eq!(&stdout, expected);
+            } else {
+                baseline = Some(stdout.clone());
+            }
+            let stderr = std::fs::read_to_string(log.path()).unwrap();
+            if terminal && !quiet {
+                assert!(stderr.contains("Calcul des métriques"), "{stderr}");
+            } else {
+                assert!(stderr.is_empty());
+            }
+            if format == "json" {
+                serde_json::from_slice::<Value>(&stdout).unwrap();
+                assert!(!stdout.contains(&0x1b));
+            }
+        }
+    }
+}
+
+#[test]
+fn failed_collection_never_announces_metric_calculation() {
+    let (_directory, arguments) = cli(&["report"], "");
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = Progress::new(log.reopen().unwrap(), true, false, true);
+    assert!(
+        run(&progress, arguments, today(), |kind, _, _| Ok(Box::new(
+            FixedSource {
+                failure: true,
+                ..fixed(kind)
+            }
+        )))
+        .is_err()
+    );
+    assert!(std::fs::read_to_string(log.path()).unwrap().is_empty());
+}
+
+#[test]
+fn partial_statistics_warnings_survive_quiet_and_non_tty_progress() {
+    for (command, format) in [
+        ("report", "json"),
+        ("report", "table"),
+        ("report", "markdown"),
+        ("github", "json"),
+        ("github", "table"),
+    ] {
+        let mut baseline = None;
+        for (terminal, options) in [
+            (true, vec![]),
+            (true, vec!["--verbose"]),
+            (true, vec!["--quiet", "--verbose"]),
+            (false, vec!["--verbose"]),
+        ] {
+            let mut arguments = vec![command, "--format", format];
+            if command == "github" {
+                arguments.extend(["--from", "2026-09-01", "--to", "2026-10-30"]);
+            }
+            arguments.extend(options);
+            let (_directory, cli) = cli(&arguments, "");
+            let quiet = cli.quiet;
+            let log = tempfile::NamedTempFile::new().unwrap();
+            let progress = Progress::new(
+                log.as_file().try_clone().unwrap(),
+                terminal,
+                cli.quiet,
+                cli.verbose,
+            );
+            let stdout = run_with_warnings(
+                &progress,
+                cli,
+                today(),
+                |_, _, _| Ok(Box::new(WarningSource)),
+                &mut log.as_file().try_clone().unwrap(),
+            )
+            .unwrap();
+            if let Some(expected) = &baseline {
+                assert_eq!(&stdout, expected);
+            } else {
+                baseline = Some(stdout.clone());
+            }
+            let stderr = std::fs::read_to_string(log.path()).unwrap();
+            let warning_lines = stderr
+                .lines()
+                .filter(|line| line.starts_with('{'))
+                .collect::<Vec<_>>();
+            let warning = if format == "json" {
+                assert!(warning_lines.is_empty());
+                serde_json::from_str::<Value>(&stdout).unwrap()["warnings"][0].clone()
+            } else {
+                assert_eq!(warning_lines.len(), 1, "{stderr}");
+                assert!(!stdout.contains("FILE_STATISTICS_MISMATCH"));
+                serde_json::from_str::<Value>(warning_lines[0]).unwrap()
+            };
+            assert_eq!(warning["code"], "FILE_STATISTICS_MISMATCH");
+            if quiet || !terminal {
+                assert!(stderr.lines().all(|line| line.starts_with('{')), "{stderr}");
+            } else if command == "report" {
+                assert!(stderr.contains("Calcul des métriques"), "{stderr}");
+            }
+        }
+    }
 }

@@ -2,6 +2,7 @@ mod api;
 mod auth;
 
 pub use crate::activity::*;
+use crate::progress::{Event, Progress};
 use api::{
     Api, CommentDetail, CommitDetail, CommitReference, FileDetail, Issue, PullRequestDetail,
     ReviewDetail,
@@ -34,6 +35,11 @@ impl ActivitySource for GitHubSource {
 }
 
 impl GitHubSource {
+    pub fn with_progress(mut self, progress: Progress) -> Self {
+        self.api.progress = progress;
+        self
+    }
+
     pub fn new(api_base: Url, token: &str) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             api: Api::new(api_base, token)?,
@@ -41,11 +47,13 @@ impl GitHubSource {
     }
 
     pub fn authenticated_user(&self) -> Result<String, Box<dyn Error>> {
+        self.api.progress.emit(Event::Identifying(Source::GitHub));
         let (user, _): (api::User, _) = self.api.get("user", &[])?;
         Ok(user.login)
     }
 
     pub fn activity(&self, user: &str, period: Period) -> Result<Activity, Box<dyn Error>> {
+        self.api.progress.emit(Event::Source(Source::GitHub));
         if user.is_empty()
             || user.len() > 39
             || !user.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
@@ -77,7 +85,27 @@ impl GitHubSource {
                 candidates.insert((repository, issue.number), issue.pull_request.is_some());
             }
         }
+        let total = candidates
+            .keys()
+            .map(|(repository, _)| repository)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let mut visited = BTreeSet::new();
+        self.api.progress.emit(Event::Repositories {
+            source: Source::GitHub,
+            stage: "PRs et commentaires",
+            current: 0,
+            total,
+        });
         for ((repository, number), is_pr) in candidates {
+            if visited.insert(repository.clone()) {
+                self.api.progress.emit(Event::Repositories {
+                    source: Source::GitHub,
+                    stage: "PRs et commentaires",
+                    current: visited.len(),
+                    total,
+                });
+            }
             self.comments(&mut activity, &repository, number, CommentKind::Discussion)?;
             if !is_pr {
                 continue;
@@ -234,7 +262,27 @@ impl GitHubSource {
                 );
             }
         }
+        let total = commit_keys
+            .iter()
+            .map(|(repository, _)| repository)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let mut visited = BTreeSet::new();
+        self.api.progress.emit(Event::Repositories {
+            source: Source::GitHub,
+            stage: "commits",
+            current: 0,
+            total,
+        });
         for (repository, sha) in commit_keys {
+            if visited.insert(repository.clone()) {
+                self.api.progress.emit(Event::Repositories {
+                    source: Source::GitHub,
+                    stage: "commits",
+                    current: visited.len(),
+                    total,
+                });
+            }
             api::validate_repository(&repository)?;
             if sha.is_empty() || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
                 return Err("SHA GitHub invalide".into());
