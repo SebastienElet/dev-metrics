@@ -140,6 +140,34 @@ pub struct Commit {
     pub files: Vec<FileChange>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WarningSubject {
+    PullRequest { number: u64 },
+    Commit { sha: String },
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WarningCode {
+    FileStatisticsMissing,
+    FileStatisticsMismatch,
+    FileCountMismatch,
+    FileLimitReached,
+    FilePaginationIncomplete,
+    FilePaginationInconsistent,
+    DuplicateFiles,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityWarning {
+    pub source: Source,
+    pub repository: String,
+    pub subject: WarningSubject,
+    pub code: WarningCode,
+    pub message: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Activity {
     pub schema_version: u32,
@@ -151,6 +179,7 @@ pub struct Activity {
     pub reviews_received: Vec<Review>,
     pub comments: Vec<Comment>,
     pub commits: Vec<Commit>,
+    pub warnings: Vec<ActivityWarning>,
 }
 
 impl Activity {
@@ -165,6 +194,7 @@ impl Activity {
             reviews_received: Vec::new(),
             comments: Vec::new(),
             commits: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 }

@@ -45,6 +45,7 @@ fn activity() -> Activity {
     previous.first_review_received_at = Some("2026-10-23T01:00:00Z".parse().unwrap());
     Activity {
         schema_version: 1,
+        warnings: vec![],
         source: Source::GitHub,
         user: "alice".into(),
         period: Period::parse("2026-09-01", "2026-10-30").unwrap(),

@@ -1,0 +1,122 @@
+{
+  "binary": {
+    "stats": {
+      "additions": 100,
+      "deletions": 20
+    },
+    "changed_files": 4,
+    "files": [
+      {
+        "filename": "src/main.rs",
+        "additions": 4,
+        "deletions": 1
+      },
+      {
+        "filename": "assets/logo.png",
+        "status": "added"
+      },
+      {
+        "filename": "Cargo.lock",
+        "additions": 10,
+        "deletions": 3
+      },
+      {
+        "filename": "src/generated/api.rs",
+        "additions": 5,
+        "deletions": 2
+      }
+    ]
+  },
+  "rename": {
+    "stats": {
+      "additions": 100,
+      "deletions": 20
+    },
+    "changed_files": 2,
+    "files": [
+      {
+        "filename": "src/new.rs",
+        "previous_filename": "generated/old.rs",
+        "status": "renamed",
+        "additions": 10,
+        "deletions": 3
+      },
+      {
+        "filename": "src/main.rs",
+        "additions": 4,
+        "deletions": 1
+      }
+    ]
+  },
+  "large_pr": {
+    "stats": {
+      "additions": 4000,
+      "deletions": 100
+    },
+    "changed_files": 3001,
+    "files": [
+      {
+        "filename": "src/main.rs",
+        "additions": 4,
+        "deletions": 1
+      },
+      {
+        "filename": "Cargo.lock",
+        "additions": 10,
+        "deletions": 3
+      }
+    ]
+  },
+  "file_count_mismatch": {
+    "stats": {
+      "additions": 4,
+      "deletions": 1
+    },
+    "changed_files": 2,
+    "files": [
+      {
+        "filename": "src/main.rs",
+        "additions": 4,
+        "deletions": 1
+      }
+    ]
+  },
+  "commit_pages": [
+    {
+      "sha": "abc123",
+      "html_url": "https://github.com/octocat/project/commit/abc123",
+      "commit": {
+        "message": "Partial diff",
+        "author": {
+          "date": "2026-10-05T00:00:00Z"
+        }
+      },
+      "stats": {
+        "additions": 100,
+        "deletions": 20
+      },
+      "files": [
+        {
+          "filename": "Cargo.lock",
+          "additions": 10,
+          "deletions": 3
+        }
+      ]
+    },
+    {
+      "sha": "abc123",
+      "html_url": "https://github.com/octocat/project/commit/abc123",
+      "commit": {
+        "message": "Partial diff",
+        "author": {
+          "date": "2026-10-05T00:00:00Z"
+        }
+      },
+      "stats": {
+        "additions": 100,
+        "deletions": 20
+      },
+      "files": []
+    }
+  ]
+}

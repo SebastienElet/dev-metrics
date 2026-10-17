@@ -1,4 +1,4 @@
-use crate::activity::{FileChange, ReviewState};
+use crate::activity::ReviewState;
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK};
@@ -232,7 +232,7 @@ pub(super) struct CommitDetail {
     pub html_url: String,
     pub commit: CommitMetadata,
     pub stats: Statistics,
-    pub files: Vec<FileChange>,
+    pub files: Vec<FileDetail>,
 }
 
 #[derive(Deserialize)]
@@ -250,4 +250,12 @@ pub(super) struct CommitAuthor {
 pub(super) struct Statistics {
     pub additions: u64,
     pub deletions: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct FileDetail {
+    pub filename: String,
+    pub previous_filename: Option<String>,
+    pub additions: Option<u64>,
+    pub deletions: Option<u64>,
 }
