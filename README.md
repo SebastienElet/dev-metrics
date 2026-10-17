@@ -7,7 +7,15 @@ ou, pour les rapports, en résumé Markdown.
 
 ## Installation
 
-Avec [Rust et Cargo](https://rustup.rs/) installés :
+Après la première release npm :
+
+```sh
+npx @sebastienelet/dev-metrics --help
+bunx @sebastienelet/dev-metrics --help
+```
+
+Pour installer durablement : `npm install -g @sebastienelet/dev-metrics`.
+En attendant, avec [Rust et Cargo](https://rustup.rs/) installés :
 
 ```sh
 cargo install --git https://github.com/SebastienElet/dev-metrics
