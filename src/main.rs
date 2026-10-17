@@ -2,6 +2,7 @@ mod cli;
 
 use chrono::{DateTime, Datelike, Days, NaiveDate, Utc};
 use clap::{Parser, error::ErrorKind};
+use cli::config::{CheckFormat, ConfigAction};
 use cli::error::{CommandError, ErrorCode};
 use cli::{ActivityFormat, Cli, Command, ReportFormat, SourceKind};
 use dev_metrics::activity::{ActivitySource, Period};
@@ -12,24 +13,32 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let result = match Cli::try_parse() {
-        Ok(cli) => run(
-            cli,
-            DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive(),
-            load_source,
-        ),
+        Ok(cli) => match &cli.command {
+            Command::Config {
+                action: ConfigAction::Check { format },
+            } => run_config_check(&cli, *format),
+            _ => run(
+                cli,
+                DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive(),
+                load_source,
+            )
+            .map(|output| (output, 0)),
+        },
         Err(error)
             if matches!(
                 error.kind(),
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ) =>
         {
-            Ok(error.to_string())
+            Ok((error.to_string(), 0))
         }
         Err(error) => Err(CommandError::new(ErrorCode::InvalidArguments, error)),
     };
-    let result = result.and_then(|output| write_output(&mut std::io::stdout().lock(), &output));
+    let result = result.and_then(|(output, code)| {
+        write_output(&mut std::io::stdout().lock(), &output).map(|()| code)
+    });
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(error) => {
             if let Ok(json) = serde_json::to_string(&error) {
                 let _ = writeln!(std::io::stderr().lock(), "{json}");
@@ -37,6 +46,14 @@ fn main() -> ExitCode {
             ExitCode::from(error.exit_code())
         }
     }
+}
+
+fn run_config_check(cli: &Cli, format: CheckFormat) -> Result<(String, u8), CommandError> {
+    let path = config_path(cli.config.clone(), std::env::var_os("HOME"))
+        .map_err(|error| CommandError::new(ErrorCode::ConfigurationError, error))?;
+    let report = cli::config::check::run(&path)?;
+    let code = if report.success() { 0 } else { 4 };
+    Ok((report.render(format)?, code))
 }
 
 fn write_output(writer: &mut impl Write, output: &str) -> Result<(), CommandError> {
@@ -260,13 +277,16 @@ fn load_source(
                 configured.and_then(|config| config.token.as_deref()),
             )
             .map_err(auth_error)?;
-            dev_metrics::bitbucket::BitbucketSource::new(
-                "https://api.bitbucket.org/2.0/".parse().unwrap(),
-                &token,
-                workspace,
-            )
-            .map(|source| Box::new(source) as Box<dyn ActivitySource>)
-            .map_err(auth_error)
+            let api_base = "https://api.bitbucket.org/2.0/".parse().unwrap();
+            let source = match configured.and_then(|config| config.email.as_deref()) {
+                Some(email) => dev_metrics::bitbucket::BitbucketSource::new_with_email(
+                    api_base, &token, email, workspace,
+                ),
+                None => dev_metrics::bitbucket::BitbucketSource::new(api_base, &token, workspace),
+            };
+            source
+                .map(|source| Box::new(source) as Box<dyn ActivitySource>)
+                .map_err(auth_error)
         }
     }
 }

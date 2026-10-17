@@ -49,6 +49,35 @@ fn resolves_authenticated_identity_and_returns_versioned_empty_output() {
 }
 
 #[test]
+fn authenticates_with_atlassian_email_when_configured() {
+    let mut server = Server::new();
+    let authorization = "Basic YWxpY2VAZXhhbXBsZS50ZXN0OmZha2UtYml0YnVja2V0LXRva2Vu";
+    let identity = server
+        .mock("GET", "/2.0/user")
+        .match_header("authorization", authorization)
+        .with_header("content-type", "application/json")
+        .with_body(user("{alice}").to_string())
+        .create();
+    let repositories = server
+        .mock("GET", "/2.0/repositories/team")
+        .match_query(Matcher::Any)
+        .match_header("authorization", authorization)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"values": []}).to_string())
+        .create();
+    let source = BitbucketSource::new_with_email(
+        format!("{}/2.0/", server.url()).parse().unwrap(),
+        "fake-bitbucket-token",
+        "alice@example.test",
+        "team",
+    )
+    .unwrap();
+    assert_eq!(source.activity(None, period()).unwrap().user, "{alice}");
+    identity.assert();
+    repositories.assert();
+}
+
+#[test]
 fn refuses_http_and_malformed_responses_without_echoing_secrets() {
     for (status, body) in [
         (401, "test-token"),

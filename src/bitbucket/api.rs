@@ -1,5 +1,5 @@
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LOCATION};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Url, redirect, retry};
 use serde::{Deserialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
@@ -9,10 +9,21 @@ use std::time::Duration;
 pub(super) struct Api {
     base: Url,
     client: Client,
+    token: String,
+    email: Option<String>,
 }
 
 impl Api {
-    pub fn new(mut base: Url, token: &str) -> Result<Self, Box<dyn Error>> {
+    pub fn new(base: Url, token: &str) -> Result<Self, Box<dyn Error>> {
+        Self::build(base, token, None)
+    }
+
+    pub fn new_with_email(base: Url, token: &str, email: &str) -> Result<Self, Box<dyn Error>> {
+        crate::config::validate_setting("bitbucket.email", email)?;
+        Self::build(base, token, Some(email))
+    }
+
+    fn build(mut base: Url, token: &str, email: Option<&str>) -> Result<Self, Box<dyn Error>> {
         if !base.path().ends_with('/') {
             base.set_path(&format!("{}/", base.path()));
         }
@@ -31,11 +42,7 @@ impl Api {
         {
             return Err("Token Bitbucket invalide".into());
         }
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| "Token Bitbucket invalide")?;
-        authorization.set_sensitive(true);
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, authorization);
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         let client = Client::builder()
             .user_agent("dev-metrics")
@@ -45,7 +52,12 @@ impl Api {
             .redirect(redirect::Policy::none())
             .retry(retry::never())
             .build()?;
-        Ok(Self { base, client })
+        Ok(Self {
+            base,
+            client,
+            token: token.into(),
+            email: email.map(str::to_owned),
+        })
     }
 
     fn checked_url(&self, url: Url) -> Result<Url, Box<dyn Error>> {
@@ -72,7 +84,12 @@ impl Api {
             if !visited.insert(url.to_string()) {
                 return Err("Redirection Bitbucket cyclique".into());
             }
-            let response = self.client.get(url.clone()).send().map_err(|error| {
+            let request = self.client.get(url.clone());
+            let request = match &self.email {
+                Some(email) => request.basic_auth(email, Some(&self.token)),
+                None => request.bearer_auth(&self.token),
+            };
+            let response = request.send().map_err(|error| {
                 if error.is_timeout() {
                     "Bitbucket : timeout"
                 } else {

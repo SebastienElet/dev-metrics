@@ -40,6 +40,19 @@ impl BitbucketSource {
         })
     }
 
+    pub fn new_with_email(
+        api_base: Url,
+        token: &str,
+        email: &str,
+        workspace: &str,
+    ) -> Result<Self, Box<dyn Error>> {
+        validate_workspace(workspace)?;
+        Ok(Self {
+            api: api::Api::new_with_email(api_base, token, email)?,
+            workspace: workspace.into(),
+        })
+    }
+
     pub fn activity(&self, user: Option<&str>, period: Period) -> Result<Activity, Box<dyn Error>> {
         if user.is_some_and(|value| !valid_user_identifier(value)) {
             return Err("Utilisateur Bitbucket invalide".into());
