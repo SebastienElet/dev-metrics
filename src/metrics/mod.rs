@@ -1,7 +1,7 @@
 mod output;
 pub use output::REPORT_SCHEMA;
 
-use crate::activity::{Activity, ActivitySource, FileChange, Period, Source};
+use crate::activity::{Activity, ActivitySource, ActivityWarning, FileChange, Period, Source};
 use chrono::{DateTime, Days, NaiveDate, Utc};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -79,6 +79,7 @@ pub struct MetricsReport {
     pub windows: Vec<WindowMetrics>,
     pub by_source: Vec<SourceMetrics>,
     pub by_repository: Vec<RepositoryMetrics>,
+    pub warnings: Vec<ActivityWarning>,
 }
 
 pub struct SourceRequest<'a> {
@@ -315,6 +316,10 @@ fn calculate_windows(
         windows: windows(activities, periods, config, None, None)?,
         by_source,
         by_repository,
+        warnings: activities
+            .iter()
+            .flat_map(|activity| activity.warnings.iter().cloned())
+            .collect(),
     })
 }
 
@@ -396,15 +401,10 @@ fn snapshot(
             }
             if period.contains(pr.created_at) {
                 result.opened += 1;
-                let lines = pr
-                    .files
-                    .iter()
-                    .filter(|file| !config.excludes(file))
-                    .try_fold(0_u64, |total, file| {
-                        total
-                            .checked_add(file.additions)?
-                            .checked_add(file.deletions)
-                    })
+                let (additions, deletions) =
+                    included_lines(&pr.files, pr.additions, pr.deletions, config);
+                let lines = additions
+                    .checked_add(deletions)
                     .ok_or("Statistiques trop grandes")?;
                 result.pull_request_lines.push(lines as f64);
                 result.large_pull_requests += u64::from(lines > 400);
@@ -429,19 +429,36 @@ fn snapshot(
                 continue;
             }
             result.commits += 1;
-            for file in commit.files.iter().filter(|file| !config.excludes(file)) {
-                result.additions = result
-                    .additions
-                    .checked_add(file.additions)
-                    .ok_or("Statistiques trop grandes")?;
-                result.deletions = result
-                    .deletions
-                    .checked_add(file.deletions)
-                    .ok_or("Statistiques trop grandes")?;
-            }
+            let (additions, deletions) =
+                included_lines(&commit.files, commit.additions, commit.deletions, config);
+            result.additions = result
+                .additions
+                .checked_add(additions)
+                .ok_or("Statistiques trop grandes")?;
+            result.deletions = result
+                .deletions
+                .checked_add(deletions)
+                .ok_or("Statistiques trop grandes")?;
         }
     }
     Ok(result)
+}
+
+fn included_lines(
+    files: &[FileChange],
+    additions: u64,
+    deletions: u64,
+    config: &MetricsConfig,
+) -> (u64, u64) {
+    files.iter().filter(|file| config.excludes(file)).fold(
+        (additions, deletions),
+        |(added, deleted), file| {
+            (
+                added.saturating_sub(file.additions),
+                deleted.saturating_sub(file.deletions),
+            )
+        },
+    )
 }
 
 fn same_user(source: Source, left: &str, right: &str) -> bool {

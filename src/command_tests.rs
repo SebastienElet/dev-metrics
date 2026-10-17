@@ -28,6 +28,7 @@ impl ActivitySource for FixedSource {
         }
         Ok(Activity {
             schema_version: 1,
+            warnings: vec![],
             source: self.source,
             user: "alice".into(),
             period,
@@ -42,8 +43,8 @@ impl ActivitySource for FixedSource {
                 message: String::new(),
                 url: String::new(),
                 authored_at: "2026-10-30T12:00:00Z".parse().unwrap(),
-                additions: 5,
-                deletions: 1,
+                additions: if self.overflow { u64::MAX } else { 7 },
+                deletions: 2,
                 files: vec![
                     FileChange {
                         path: "src/lib.rs".into(),
@@ -391,7 +392,7 @@ fn raw_activity_json_is_compact_and_preserves_its_contract() {
     let value: Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["schema_version"], 1);
     assert_eq!(value["source"], "github");
-    assert_eq!(value["commits"][0]["additions"], 5);
+    assert_eq!(value["commits"][0]["additions"], 7);
 }
 
 #[test]
@@ -460,4 +461,97 @@ fn custom_period_defaults_to_today_and_schema_command_validates_its_output() {
         .unwrap()
         .validate(&value)
         .unwrap();
+}
+
+struct WarningSource;
+
+impl ActivitySource for WarningSource {
+    fn collect_activity(
+        &self,
+        user: Option<&str>,
+        period: Period,
+    ) -> Result<Activity, Box<dyn Error>> {
+        let mut activity = fixed(SourceKind::Github).collect_activity(user, period)?;
+        activity
+            .warnings
+            .push(dev_metrics::activity::ActivityWarning {
+                source: Source::GitHub,
+                repository: "team/project".into(),
+                subject: dev_metrics::activity::WarningSubject::Commit {
+                    sha: "abc123".into(),
+                },
+                code: dev_metrics::activity::WarningCode::FileStatisticsMismatch,
+                message: "Totaux API +100/-20, détail disponible +7/-2".into(),
+            });
+        Ok(activity)
+    }
+}
+
+#[test]
+fn warnings_reach_json_or_stderr_without_polluting_table_and_markdown() {
+    for format in ["table", "markdown", "json"] {
+        let (_directory, cli) = cli(&["report", "--format", format], "");
+        let mut stderr = Vec::new();
+        let stdout = run_with_warnings(
+            cli,
+            today(),
+            |_, _, _| Ok(Box::new(WarningSource)),
+            &mut stderr,
+        )
+        .unwrap();
+        let warning = if format == "json" {
+            assert!(stderr.is_empty());
+            let value: Value = serde_json::from_str(&stdout).unwrap();
+            value["warnings"][0].clone()
+        } else {
+            assert!(!stdout.contains("FILE_STATISTICS_MISMATCH"));
+            serde_json::from_slice::<Value>(&stderr).expect("structured stderr warning")
+        };
+        assert_eq!(warning["source"], "github");
+        assert_eq!(warning["repository"], "team/project");
+        assert_eq!(warning["subject"], json!({"kind":"commit","sha":"abc123"}));
+        assert_eq!(warning["code"], "FILE_STATISTICS_MISMATCH");
+    }
+}
+
+#[test]
+fn warning_write_failures_remain_output_errors() {
+    let (_directory, cli) = cli(&["report", "--format", "table"], "");
+    let error = run_with_warnings(
+        cli,
+        today(),
+        |_, _, _| Ok(Box::new(WarningSource)),
+        &mut std::io::Cursor::new([]),
+    )
+    .unwrap_err();
+    assert_eq!(serde_json::to_value(error).unwrap()["code"], "OUTPUT_ERROR");
+}
+
+#[test]
+fn raw_activity_table_emits_warnings_on_stderr() {
+    let (_directory, cli) = cli(
+        &[
+            "github",
+            "--from",
+            "2026-09-01",
+            "--to",
+            "2026-10-30",
+            "--format",
+            "table",
+        ],
+        "",
+    );
+    let mut stderr = Vec::new();
+    let output = run_with_warnings(
+        cli,
+        today(),
+        |_, _, _| Ok(Box::new(WarningSource)),
+        &mut stderr,
+    )
+    .unwrap();
+    assert!(output.starts_with("GitHub"));
+    assert!(!output.contains("FILE_STATISTICS_MISMATCH"));
+    let warning: Value = serde_json::from_slice(&stderr).unwrap();
+    assert_eq!(warning["repository"], "team/project");
+    assert_eq!(warning["subject"], json!({"kind":"commit","sha":"abc123"}));
 }

@@ -64,11 +64,24 @@ fn write_output(writer: &mut impl Write, output: &str) -> Result<(), CommandErro
 fn run(
     cli: Cli,
     today: NaiveDate,
+    source_factory: impl FnMut(
+        SourceKind,
+        &Config,
+        Option<&str>,
+    ) -> Result<Box<dyn ActivitySource>, CommandError>,
+) -> Result<String, CommandError> {
+    run_with_warnings(cli, today, source_factory, &mut std::io::stderr().lock())
+}
+
+fn run_with_warnings(
+    cli: Cli,
+    today: NaiveDate,
     mut source_factory: impl FnMut(
         SourceKind,
         &Config,
         Option<&str>,
     ) -> Result<Box<dyn ActivitySource>, CommandError>,
+    warnings_writer: &mut impl Write,
 ) -> Result<String, CommandError> {
     if cli.command == Command::Schema {
         return Ok(REPORT_SCHEMA.into());
@@ -199,6 +212,9 @@ fn run(
                 message: error.to_string(),
                 details: serde_json::json!({"sources": selected.iter().map(|source| source.as_str()).collect::<Vec<_>>()}),
             })?;
+            if !matches!(format, ReportFormat::Json) {
+                write_warnings(warnings_writer, &report.warnings)?;
+            }
             return match format {
                 ReportFormat::Json => report
                     .json()
@@ -223,8 +239,32 @@ fn run(
     match format {
         ActivityFormat::Json => serde_json::to_string(&activity)
             .map_err(|error| CommandError::new(ErrorCode::OutputError, error)),
-        ActivityFormat::Table => Ok(activity.table()),
+        ActivityFormat::Table => {
+            write_warnings(warnings_writer, &activity.warnings)?;
+            Ok(activity.table())
+        }
     }
+}
+
+fn write_warnings(
+    writer: &mut impl Write,
+    warnings: &[dev_metrics::activity::ActivityWarning],
+) -> Result<(), CommandError> {
+    for warning in warnings {
+        serde_json::to_writer(&mut *writer, warning).map_err(|_| {
+            CommandError::new(
+                ErrorCode::OutputError,
+                "Impossible d'écrire les avertissements sur stderr",
+            )
+        })?;
+        writeln!(writer).map_err(|_| {
+            CommandError::new(
+                ErrorCode::OutputError,
+                "Impossible d'écrire les avertissements sur stderr",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn configured_bitbucket_username(config: &Config) -> Result<Option<&str>, CommandError> {

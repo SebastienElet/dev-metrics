@@ -28,6 +28,12 @@
       "items": {
         "$ref": "#/$defs/repository_metrics"
       }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/warning"
+      }
     }
   },
   "$defs": {
@@ -285,6 +291,82 @@
         },
         "windows": {
           "$ref": "#/$defs/windows"
+        }
+      }
+    },
+    "warning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "repository",
+        "subject",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "github",
+            "bitbucket"
+          ]
+        },
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subject": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "number"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "pull_request"
+                },
+                "number": {
+                  "type": "integer",
+                  "minimum": 1
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind",
+                "sha"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "commit"
+                },
+                "sha": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          ]
+        },
+        "code": {
+          "enum": [
+            "FILE_STATISTICS_MISSING",
+            "FILE_STATISTICS_MISMATCH",
+            "FILE_COUNT_MISMATCH",
+            "FILE_LIMIT_REACHED",
+            "FILE_PAGINATION_INCOMPLETE",
+            "FILE_PAGINATION_INCONSISTENT",
+            "DUPLICATE_FILES"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
         }
       }
     }

@@ -270,6 +270,8 @@ fn default_exclusions_filter_commit_volume_and_pull_request_size() {
         },
     ];
     let mut pr = pull_request("2026-10-24T00:00:00Z", 16_400);
+    pr.additions = 8300;
+    pr.deletions = 8100;
     pr.files = files.clone();
     data.pull_requests.push(pr);
     let mut change = commit("2026-10-24T00:00:00Z", 8300, 8100);
@@ -662,14 +664,44 @@ fn rejects_unrepresentable_windows_and_overflowing_line_statistics() {
     for pull_request_overflow in [false, true] {
         let mut data = activity(Source::GitHub, "alice");
         if pull_request_overflow {
-            let mut pr = pull_request("2026-10-24T00:00:00Z", 0);
+            let mut pr = pull_request("2026-10-24T00:00:00Z", u64::MAX);
+            pr.deletions = 1;
             pr.files = vec![file("src/overflow.rs", u64::MAX, 1)];
             data.pull_requests.push(pr);
         } else {
-            let mut change = commit("2026-10-24T00:00:00Z", 0, 0);
-            change.files = vec![file("src/a.rs", u64::MAX, 0), file("src/b.rs", 1, 0)];
-            data.commits.push(change);
+            data.commits
+                .push(commit("2026-10-24T00:00:00Z", u64::MAX, 0));
+            data.commits.push(commit("2026-10-24T01:00:00Z", 1, 0));
         }
         assert!(calculate(&[data], through(), &MetricsConfig::default()).is_err());
     }
+}
+
+#[test]
+fn api_totals_keep_unlisted_lines_and_subtract_only_available_exclusions() {
+    let mut data = activity(Source::GitHub, "alice");
+    let mut change = commit("2026-10-24T00:00:00Z", 100, 20);
+    change.files = vec![
+        file("src/lib.rs", 4, 1),
+        file("Cargo.lock", 10, 3),
+        file("generated/api.rs", 5, 2),
+    ];
+    data.commits.push(change);
+    let report = calculate(&[data], through(), &MetricsConfig::default()).unwrap();
+    assert_eq!(report.windows[0].metrics.lines_added.current, Some(85.0));
+    assert_eq!(report.windows[0].metrics.lines_deleted.current, Some(15.0));
+}
+
+#[test]
+fn inconsistent_exclusions_cannot_make_api_totals_negative_or_overflow() {
+    let mut data = activity(Source::GitHub, "alice");
+    let mut change = commit("2026-10-24T00:00:00Z", 10, 5);
+    change.files = vec![
+        file("Cargo.lock", u64::MAX, 2),
+        file("generated/api.rs", u64::MAX, 1),
+    ];
+    data.commits.push(change);
+    let report = calculate(&[data], through(), &MetricsConfig::default()).unwrap();
+    assert_eq!(report.windows[0].metrics.lines_added.current, Some(0.0));
+    assert_eq!(report.windows[0].metrics.lines_deleted.current, Some(2.0));
 }

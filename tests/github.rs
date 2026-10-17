@@ -489,7 +489,7 @@ fn rejects_reversed_noncanonical_or_impossible_periods() {
 }
 
 #[test]
-fn rejects_missing_or_truncated_file_statistics() {
+fn warns_about_missing_or_truncated_file_statistics() {
     for changed_files in [2, 3001] {
         let mut server = Server::new();
         empty_searches(&mut server);
@@ -503,10 +503,13 @@ fn rejects_missing_or_truncated_file_statistics() {
         let mut detail = pr_detail(7, "octocat", "2026-10-01T00:00:00Z", None, &files);
         detail["changed_files"] = json!(changed_files);
         mock_pr(&mut server, detail, files, vec![], vec![], vec![]);
-        assert!(
-            source(&server).activity("octocat", period()).is_err(),
-            "accepted {changed_files} advertised files"
+        let activity = source(&server).activity("octocat", period()).unwrap();
+        assert_warning(
+            &activity,
+            "FILE_COUNT_MISMATCH",
+            json!({"kind":"pull_request","number":7}),
         );
+        assert_eq!(activity.pull_requests[0].additions, 1);
     }
     let mut server = Server::new();
     empty_searches(&mut server);
@@ -521,7 +524,13 @@ fn rejects_missing_or_truncated_file_statistics() {
         "/repos/octocat/project/commits/abc123?per_page=100&page=1",
         json!({"sha":"abc123","html_url":"https://github.com/octocat/project/commit/abc123","commit":{"message":"Truncated","author":{"date":"2026-10-01T00:00:00Z"}},"stats":{"additions":100,"deletions":0},"files":[file("src/main.rs",1,0)]}),
     );
-    assert!(source(&server).activity("octocat", period()).is_err());
+    let activity = source(&server).activity("octocat", period()).unwrap();
+    assert_warning(
+        &activity,
+        "FILE_STATISTICS_MISMATCH",
+        json!({"kind":"commit","sha":"abc123"}),
+    );
+    assert_eq!(activity.commits[0].additions, 100);
 }
 
 #[test]
@@ -969,7 +978,7 @@ fn commit_search(server: &mut Server) {
 }
 
 #[test]
-fn refuses_inconsistent_or_empty_commit_pages() {
+fn warns_about_inconsistent_or_empty_commit_pages() {
     for kind in ["sha", "stats", "empty-first", "empty-second"] {
         let mut server = Server::new();
         commit_search(&mut server);
@@ -993,15 +1002,19 @@ fn refuses_inconsistent_or_empty_commit_pages() {
             "/repos/octocat/project/commits/abc123?per_page=100&page=2",
             second,
         );
-        assert!(
-            source(&server).activity("octocat", period()).is_err(),
-            "accepted {kind}"
-        );
+        let activity = source(&server).activity("octocat", period()).unwrap();
+        let code = if kind.starts_with("empty") {
+            "FILE_PAGINATION_INCOMPLETE"
+        } else {
+            "FILE_PAGINATION_INCONSISTENT"
+        };
+        assert_warning(&activity, code, json!({"kind":"commit","sha":"abc123"}));
+        assert_eq!(activity.commits[0].additions, 0);
     }
 }
 
 #[test]
-fn refuses_commits_at_the_3000_file_cap_even_when_line_totals_are_zero() {
+fn warns_about_commits_at_the_3000_file_cap_even_when_line_totals_are_zero() {
     for final_next in [false, true] {
         let mut server = Server::new();
         commit_search(&mut server);
@@ -1022,12 +1035,18 @@ fn refuses_commits_at_the_3000_file_cap_even_when_line_totals_are_zero() {
             }
             mock.create();
         }
-        assert!(source(&server).activity("octocat", period()).is_err());
+        let activity = source(&server).activity("octocat", period()).unwrap();
+        assert_eq!(activity.commits[0].files.len(), 3000);
+        assert_warning(
+            &activity,
+            "FILE_LIMIT_REACHED",
+            json!({"kind":"commit","sha":"abc123"}),
+        );
     }
 }
 
 #[test]
-fn refuses_overflowing_file_totals() {
+fn warns_about_overflowing_file_totals() {
     let mut server = Server::new();
     commit_search(&mut server);
     endpoint(
@@ -1035,12 +1054,12 @@ fn refuses_overflowing_file_totals() {
         "/repos/octocat/project/commits/abc123?per_page=100&page=1",
         commit_detail(vec![file("a.rs", u64::MAX, 0), file("b.rs", 1, 0)]),
     );
-    assert!(
-        source(&server)
-            .activity("octocat", period())
-            .unwrap_err()
-            .to_string()
-            .contains("incohérentes")
+    let activity = source(&server).activity("octocat", period()).unwrap();
+    assert_eq!(activity.commits[0].additions, 0);
+    assert_warning(
+        &activity,
+        "FILE_STATISTICS_MISMATCH",
+        json!({"kind":"commit","sha":"abc123"}),
     );
 }
 
@@ -1146,4 +1165,329 @@ fn common_source_collects_metrics_with_explicit_or_authenticated_identity() {
         assert_eq!(week.median_pull_request_lines.current, Some(12.0));
         assert_eq!(week.reviews_received.current, Some(1.0));
     }
+}
+
+fn partial_diff(name: &str) -> Value {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/github-partial-diffs.json")).unwrap();
+    fixtures[name].clone()
+}
+
+fn assert_warning(activity: &dev_metrics::activity::Activity, code: &str, subject: Value) {
+    assert_schema(activity);
+    let value = serde_json::to_value(activity).unwrap();
+    let warnings = value["warnings"].as_array().expect("structured warnings");
+    assert!(
+        warnings.iter().any(|warning| warning["code"] == code
+            && warning["source"] == "github"
+            && warning["repository"] == "octocat/project"
+            && warning["subject"] == subject
+            && !warning["message"].as_str().unwrap().is_empty()),
+        "{warnings:?}"
+    );
+}
+
+fn collect_partial_pr(name: &str) -> dev_metrics::activity::Activity {
+    let mut server = Server::new();
+    empty_searches(&mut server);
+    search(
+        &mut server,
+        "/search/issues",
+        "is:pr author:octocat updated:>=2026-10-01",
+        vec![issue(7, true)],
+    );
+    let fixture = partial_diff(name);
+    let mut detail = pr_detail(7, "octocat", "2026-10-05T00:00:00Z", None, &[]);
+    detail["additions"] = fixture["stats"]["additions"].clone();
+    detail["deletions"] = fixture["stats"]["deletions"].clone();
+    detail["changed_files"] = fixture["changed_files"].clone();
+    mock_pr(
+        &mut server,
+        detail,
+        fixture["files"].as_array().unwrap().clone(),
+        vec![],
+        vec![],
+        vec![],
+    );
+    source(&server).activity("octocat", period()).unwrap()
+}
+
+#[test]
+fn partial_binary_without_line_statistics_preserves_api_totals_and_available_exclusions() {
+    let activity = collect_partial_pr("binary");
+    assert_eq!(activity.pull_requests[0].additions, 100);
+    assert_eq!(activity.pull_requests[0].deletions, 20);
+    assert_eq!(activity.pull_requests[0].files.len(), 4);
+    assert_warning(
+        &activity,
+        "FILE_STATISTICS_MISSING",
+        json!({"kind":"pull_request","number":7}),
+    );
+    let report = dev_metrics::metrics::calculate_period(
+        &[activity],
+        Period::parse("2026-10-05", "2026-10-07").unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        report.windows[0].metrics.median_pull_request_lines.current,
+        Some(100.0)
+    );
+    let json: Value = serde_json::from_str(&report.json().unwrap()).unwrap();
+    assert!(!json["warnings"].as_array().unwrap().is_empty());
+    let schema: Value = serde_json::from_str(dev_metrics::metrics::REPORT_SCHEMA).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    validator.validate(&json).unwrap();
+    for field in ["repository", "subject", "code", "message"] {
+        let mut invalid = json.clone();
+        invalid["warnings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(!validator.is_valid(&invalid), "missing {field}");
+    }
+}
+
+#[test]
+fn partial_rename_without_patch_preserves_api_totals_and_excludes_previous_generated_path() {
+    let activity = collect_partial_pr("rename");
+    assert_warning(
+        &activity,
+        "FILE_STATISTICS_MISMATCH",
+        json!({"kind":"pull_request","number":7}),
+    );
+    let report = dev_metrics::metrics::calculate_period(
+        &[activity],
+        Period::parse("2026-10-05", "2026-10-07").unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        report.windows[0].metrics.median_pull_request_lines.current,
+        Some(107.0)
+    );
+}
+
+#[test]
+fn partial_pr_over_3000_files_uses_totals_and_warns_about_truncation() {
+    let activity = collect_partial_pr("large_pr");
+    assert_eq!(activity.pull_requests[0].additions, 4000);
+    assert_eq!(activity.pull_requests[0].files.len(), 2);
+    assert_warning(
+        &activity,
+        "FILE_LIMIT_REACHED",
+        json!({"kind":"pull_request","number":7}),
+    );
+    let report = dev_metrics::metrics::calculate_period(
+        &[activity],
+        Period::parse("2026-10-05", "2026-10-07").unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        report.windows[0].metrics.median_pull_request_lines.current,
+        Some(4087.0)
+    );
+}
+
+#[test]
+fn partial_pr_file_count_mismatch_warns_even_when_line_totals_match() {
+    let activity = collect_partial_pr("file_count_mismatch");
+    assert_warning(
+        &activity,
+        "FILE_COUNT_MISMATCH",
+        json!({"kind":"pull_request","number":7}),
+    );
+    assert_eq!(activity.pull_requests[0].additions, 4);
+}
+
+#[test]
+fn partial_commit_pagination_keeps_first_page_totals_and_available_exclusions() {
+    let mut server = Server::new();
+    commit_search(&mut server);
+    let pages = partial_diff("commit_pages");
+    server
+        .mock(
+            "GET",
+            "/repos/octocat/project/commits/abc123?per_page=100&page=1",
+        )
+        .with_header("link", "<https://api.github.com/next>; rel=\"next\"")
+        .with_header("content-type", "application/json")
+        .with_body(pages[0].to_string())
+        .create();
+    endpoint(
+        &mut server,
+        "/repos/octocat/project/commits/abc123?per_page=100&page=2",
+        pages[1].clone(),
+    );
+    let activity = source(&server).activity("octocat", period()).unwrap();
+    assert_eq!(activity.commits[0].additions, 100);
+    assert_warning(
+        &activity,
+        "FILE_PAGINATION_INCOMPLETE",
+        json!({"kind":"commit","sha":"abc123"}),
+    );
+    let report = dev_metrics::metrics::calculate_period(
+        &[activity],
+        Period::parse("2026-10-05", "2026-10-07").unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(report.windows[0].metrics.lines_added.current, Some(90.0));
+    assert_eq!(report.windows[0].metrics.lines_deleted.current, Some(17.0));
+}
+
+#[test]
+fn partial_commit_binary_preserves_totals_and_does_not_require_a_patch() {
+    let mut server = Server::new();
+    commit_search(&mut server);
+    let fixture = partial_diff("binary");
+    let mut detail = partial_diff("commit_pages")[0].clone();
+    detail["files"] = fixture["files"].clone();
+    endpoint(
+        &mut server,
+        "/repos/octocat/project/commits/abc123?per_page=100&page=1",
+        detail,
+    );
+    let activity = source(&server).activity("octocat", period()).unwrap();
+    assert_warning(
+        &activity,
+        "FILE_STATISTICS_MISSING",
+        json!({"kind":"commit","sha":"abc123"}),
+    );
+    let report = dev_metrics::metrics::calculate_period(
+        &[activity],
+        Period::parse("2026-10-05", "2026-10-07").unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(report.windows[0].metrics.lines_added.current, Some(85.0));
+    assert_eq!(report.windows[0].metrics.lines_deleted.current, Some(15.0));
+}
+
+#[test]
+fn empty_pr_file_page_with_next_link_warns_without_hanging() {
+    let mut server = Server::new();
+    empty_searches(&mut server);
+    search(
+        &mut server,
+        "/search/issues",
+        "is:pr author:octocat updated:>=2026-10-01",
+        vec![issue(7, true)],
+    );
+    let files = vec![file("src/main.rs", 5, 1)];
+    mock_pr(
+        &mut server,
+        pr_detail(7, "octocat", "2026-10-05T00:00:00Z", None, &files),
+        files,
+        vec![],
+        vec![],
+        vec![],
+    );
+    server
+        .mock(
+            "GET",
+            "/repos/octocat/project/pulls/7/files?per_page=100&page=1",
+        )
+        .with_header("link", "<https://api.github.com/next>; rel=\"next\"")
+        .with_header("content-type", "application/json")
+        .with_body("[]")
+        .create();
+    let activity = source(&server).activity("octocat", period()).unwrap();
+    assert_warning(
+        &activity,
+        "FILE_PAGINATION_INCOMPLETE",
+        json!({"kind":"pull_request","number":7}),
+    );
+    assert_eq!(activity.pull_requests[0].additions, 5);
+    assert!(activity.pull_requests[0].files.is_empty());
+}
+
+#[test]
+fn duplicate_paginated_files_are_excluded_only_once() {
+    let mut server = Server::new();
+    commit_search(&mut server);
+    let detail = partial_diff("commit_pages")[0].clone();
+    server
+        .mock(
+            "GET",
+            "/repos/octocat/project/commits/abc123?per_page=100&page=1",
+        )
+        .with_header("link", "<https://api.github.com/next>; rel=\"next\"")
+        .with_header("content-type", "application/json")
+        .with_body(detail.to_string())
+        .create();
+    endpoint(
+        &mut server,
+        "/repos/octocat/project/commits/abc123?per_page=100&page=2",
+        detail,
+    );
+    let activity = source(&server).activity("octocat", period()).unwrap();
+    assert_warning(
+        &activity,
+        "DUPLICATE_FILES",
+        json!({"kind":"commit","sha":"abc123"}),
+    );
+    assert_eq!(activity.commits[0].files.len(), 1);
+    let report = dev_metrics::metrics::calculate_period(
+        &[activity],
+        Period::parse("2026-10-05", "2026-10-07").unwrap(),
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(report.windows[0].metrics.lines_added.current, Some(90.0));
+}
+
+#[test]
+fn http_and_invalid_response_errors_during_commit_pagination_still_fail_collection() {
+    for status in [401, 403, 429, 500, 200] {
+        let mut server = Server::new();
+        commit_search(&mut server);
+        server
+            .mock(
+                "GET",
+                "/repos/octocat/project/commits/abc123?per_page=100&page=1",
+            )
+            .with_header("link", "<https://api.github.com/next>; rel=\"next\"")
+            .with_header("content-type", "application/json")
+            .with_body(partial_diff("commit_pages")[0].to_string())
+            .create();
+        server
+            .mock(
+                "GET",
+                "/repos/octocat/project/commits/abc123?per_page=100&page=2",
+            )
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body("invalid")
+            .create();
+        let error = source(&server)
+            .activity("octocat", period())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(if status == 200 {
+                "Réponse GitHub invalide"
+            } else {
+                "HTTP"
+            }),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn connection_failure_still_fails_collection() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let source =
+        GitHubSource::new(format!("http://{address}/").parse().unwrap(), "test-token").unwrap();
+    assert!(
+        source
+            .activity("octocat", period())
+            .unwrap_err()
+            .to_string()
+            .contains("échec réseau")
+    );
 }

@@ -3,7 +3,8 @@ mod auth;
 
 pub use crate::activity::*;
 use api::{
-    Api, CommentDetail, CommitDetail, CommitReference, Issue, PullRequestDetail, ReviewDetail,
+    Api, CommentDetail, CommitDetail, CommitReference, FileDetail, Issue, PullRequestDetail,
+    ReviewDetail,
 };
 pub use auth::resolve_token;
 use reqwest::Url;
@@ -154,14 +155,54 @@ impl GitHubSource {
                 .any(|c| c.repository == repository && c.issue_number == number);
             if authored_in_period || reviewed_in_period || received_in_period || commented_in_period
             {
+                let subject = WarningSubject::PullRequest { number };
                 if detail.changed_files > 3000 {
-                    return Err("PR GitHub au-delà de 3000 fichiers ; diff tronqué".into());
+                    activity.warnings.push(warning(
+                        &repository,
+                        &subject,
+                        WarningCode::FileLimitReached,
+                        format!(
+                            "{} fichiers annoncés ; GitHub limite le détail à 3000 fichiers",
+                            detail.changed_files
+                        ),
+                    ));
                 }
-                let files = self.api.list(&format!("{endpoint}/files"))?;
+                let mut files = Vec::new();
+                for page_number in 1..=30 {
+                    let (page, next): (Vec<FileDetail>, _) = self.api.get(
+                        &format!("{endpoint}/files"),
+                        &[
+                            ("per_page", "100".into()),
+                            ("page", page_number.to_string()),
+                        ],
+                    )?;
+                    let empty = page.is_empty();
+                    files.extend(page);
+                    if !next {
+                        break;
+                    }
+                    if empty || files.len() >= 3000 || page_number == 30 {
+                        activity.warnings.push(warning(
+                            &repository,
+                            &subject,
+                            WarningCode::FilePaginationIncomplete,
+                            "Pagination des fichiers de PR interrompue avant la dernière page",
+                        ));
+                        break;
+                    }
+                }
+                let files = file_changes(
+                    &mut activity,
+                    &repository,
+                    &subject,
+                    files,
+                    detail.additions,
+                    detail.deletions,
+                );
                 if detail.changed_files != files.len() {
-                    return Err("Liste des fichiers de PR GitHub incomplète".into());
+                    activity.warnings.push(warning(&repository, &subject, WarningCode::FileCountMismatch,
+                        format!("{} fichiers annoncés, {} fichiers disponibles ; exclusions limitées aux fichiers disponibles", detail.changed_files, files.len())));
                 }
-                validate_files(&files, detail.additions, detail.deletions)?;
                 activity.pull_requests.push(PullRequest {
                     source: Source::GitHub,
                     repository,
@@ -203,10 +244,20 @@ impl GitHubSource {
                 &endpoint,
                 &[("per_page", "100".into()), ("page", "1".into())],
             )?;
+            let subject = WarningSubject::Commit { sha: sha.clone() };
             let mut number = 2;
             while next {
-                if detail.files.is_empty() || detail.files.len() >= 3000 {
-                    return Err("Liste des fichiers de commit GitHub incomplète".into());
+                if detail.files.len() >= 3000 {
+                    break;
+                }
+                if detail.files.is_empty() || number > 30 {
+                    activity.warnings.push(warning(
+                        &repository,
+                        &subject,
+                        WarningCode::FilePaginationIncomplete,
+                        "Pagination des fichiers de commit interrompue avant la dernière page",
+                    ));
+                    break;
                 }
                 let (page, more): (CommitDetail, _) = self.api.get(
                     &endpoint,
@@ -215,22 +266,42 @@ impl GitHubSource {
                 if page.sha != detail.sha
                     || page.stats.additions != detail.stats.additions
                     || page.stats.deletions != detail.stats.deletions
-                    || page.files.is_empty()
                 {
-                    return Err("Pagination des fichiers de commit GitHub incohérente".into());
+                    activity.warnings.push(warning(&repository, &subject, WarningCode::FilePaginationInconsistent,
+                        "Métadonnées de commit différentes entre les pages ; totaux de la première page conservés"));
+                }
+                if page.sha != detail.sha {
+                    break;
+                }
+                if page.files.is_empty() {
+                    activity.warnings.push(warning(
+                        &repository,
+                        &subject,
+                        WarningCode::FilePaginationIncomplete,
+                        "Page de fichiers de commit vide après une page annonçant une suite",
+                    ));
+                    break;
                 }
                 detail.files.extend(page.files);
                 next = more;
                 number += 1;
             }
             if detail.files.len() >= 3000 {
-                return Err("Diff de commit GitHub potentiellement tronqué à 3000 fichiers".into());
+                activity.warnings.push(warning(
+                    &repository,
+                    &subject,
+                    WarningCode::FileLimitReached,
+                    "Limite GitHub de 3000 fichiers atteinte ; le diff peut être tronqué",
+                ));
             }
-            validate_files(
-                &detail.files,
+            let files = file_changes(
+                &mut activity,
+                &repository,
+                &subject,
+                detail.files,
                 detail.stats.additions,
                 detail.stats.deletions,
-            )?;
+            );
             activity.commits.push(Commit {
                 source: Source::GitHub,
                 repository,
@@ -240,7 +311,7 @@ impl GitHubSource {
                 authored_at: detail.commit.author.date,
                 additions: detail.stats.additions,
                 deletions: detail.stats.deletions,
-                files: detail.files,
+                files,
             });
         }
         Ok(activity)
@@ -282,21 +353,73 @@ impl GitHubSource {
     }
 }
 
-fn validate_files(
-    files: &[FileChange],
+fn warning(
+    repository: &str,
+    subject: &WarningSubject,
+    code: WarningCode,
+    message: impl Into<String>,
+) -> ActivityWarning {
+    ActivityWarning {
+        source: Source::GitHub,
+        repository: repository.into(),
+        subject: subject.clone(),
+        code,
+        message: message.into(),
+    }
+}
+
+fn file_changes(
+    activity: &mut Activity,
+    repository: &str,
+    subject: &WarningSubject,
+    files: Vec<FileDetail>,
     additions: u64,
     deletions: u64,
-) -> Result<(), Box<dyn Error>> {
-    let totals = files
-        .iter()
-        .try_fold((0_u64, 0_u64), |(added, deleted), file| {
-            Some((
-                added.checked_add(file.additions)?,
-                deleted.checked_add(file.deletions)?,
-            ))
-        });
-    if totals != Some((additions, deletions)) {
-        return Err("Statistiques de fichiers GitHub incomplètes ou incohérentes".into());
+) -> Vec<FileChange> {
+    let mut paths = BTreeSet::new();
+    let mut missing = 0;
+    let mut duplicates = 0;
+    let files: Vec<_> = files
+        .into_iter()
+        .filter_map(|file| {
+            if !paths.insert(file.filename.clone()) {
+                duplicates += 1;
+                return None;
+            }
+            if file.additions.is_none() || file.deletions.is_none() {
+                missing += 1;
+            }
+            Some(FileChange {
+                path: file.filename,
+                previous_path: file.previous_filename,
+                additions: file.additions.unwrap_or(0),
+                deletions: file.deletions.unwrap_or(0),
+            })
+        })
+        .collect();
+    if duplicates > 0 {
+        activity.warnings.push(warning(
+            repository,
+            subject,
+            WarningCode::DuplicateFiles,
+            format!("{duplicates} fichiers dupliqués ignorés ; première occurrence conservée"),
+        ));
     }
-    Ok(())
+    if missing > 0 {
+        activity.warnings.push(warning(repository, subject, WarningCode::FileStatisticsMissing,
+            format!("Statistiques absentes pour {missing} fichiers ; totaux API conservés, exclusions limitées aux statistiques disponibles")));
+    }
+    let (added, deleted) = files
+        .iter()
+        .fold((0_u128, 0_u128), |(added, deleted), file| {
+            (
+                added + u128::from(file.additions),
+                deleted + u128::from(file.deletions),
+            )
+        });
+    if (added, deleted) != (u128::from(additions), u128::from(deletions)) {
+        activity.warnings.push(warning(repository, subject, WarningCode::FileStatisticsMismatch,
+            format!("Totaux API +{additions}/-{deletions}, détail disponible +{added}/-{deleted} ; totaux API conservés, exclusions limitées aux statistiques disponibles")));
+    }
+    files
 }
