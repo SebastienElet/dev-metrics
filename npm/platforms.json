@@ -1,0 +1,7 @@
+{
+  "darwin-arm64": { "name": "@sebastienelet/dev-metrics-darwin-arm64", "target": "aarch64-apple-darwin", "binary": "dev-metrics" },
+  "darwin-x64": { "name": "@sebastienelet/dev-metrics-darwin-x64", "target": "x86_64-apple-darwin", "binary": "dev-metrics" },
+  "linux-x64": { "name": "@sebastienelet/dev-metrics-linux-x64", "target": "x86_64-unknown-linux-gnu", "binary": "dev-metrics" },
+  "linux-arm64": { "name": "@sebastienelet/dev-metrics-linux-arm64", "target": "aarch64-unknown-linux-gnu", "binary": "dev-metrics" },
+  "win32-x64": { "name": "@sebastienelet/dev-metrics-win32-x64", "target": "x86_64-pc-windows-msvc", "binary": "dev-metrics.exe" }
+}
