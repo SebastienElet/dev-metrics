@@ -10,6 +10,33 @@ fn through() -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 10, 30).unwrap()
 }
 
+#[test]
+fn custom_period_compares_equal_inclusive_windows_without_recalculating_metrics() {
+    let mut data = activity(Source::GitHub, "alice");
+    data.commits = vec![
+        commit("2026-10-24T23:59:59Z", 900, 900),
+        commit("2026-10-25T00:00:00Z", 10, 4),
+        commit("2026-10-27T23:59:59Z", 20, 2),
+        commit("2026-10-28T00:00:00Z", 12, 1),
+        commit("2026-10-30T23:59:59Z", 3, 2),
+        commit("2026-10-31T00:00:00Z", 900, 900),
+    ];
+    let report = calculate_period(
+        &[data],
+        Period::parse("2026-10-28", "2026-10-30").unwrap(),
+        &MetricsConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(report.windows.len(), 1);
+    let window = &report.windows[0];
+    assert_eq!(window.days, 3);
+    assert_eq!(window.previous_period.from.to_string(), "2026-10-25");
+    assert_eq!(window.previous_period.to.to_string(), "2026-10-27");
+    assert_comparison(&window.metrics.lines_added, 15.0, 30.0, -15.0, Some(-50.0));
+    assert_eq!(report.by_source[0].windows.len(), 1);
+    assert_eq!(report.by_repository[0].windows.len(), 1);
+}
+
 fn activity(source: Source, user: &str) -> Activity {
     Activity::empty(
         source,
@@ -467,6 +494,60 @@ fn breakdowns_include_sources_without_activity_and_repositories_with_only_commen
 struct FixedSource {
     source: Source,
     fails: bool,
+}
+
+#[test]
+fn custom_collection_covers_only_current_and_previous_days_including_leap_day() {
+    struct LeapDaySource;
+    impl ActivitySource for LeapDaySource {
+        fn collect_activity(
+            &self,
+            user: Option<&str>,
+            period: Period,
+        ) -> Result<Activity, Box<dyn Error>> {
+            assert_eq!(user, Some("alice"));
+            assert_eq!(period.from.to_string(), "2024-02-29");
+            assert_eq!(period.to.to_string(), "2024-03-01");
+            Ok(Activity::empty(Source::GitHub, "alice", period))
+        }
+    }
+    let report = collect_period(
+        &[SourceRequest {
+            source: &LeapDaySource,
+            user: Some("alice"),
+        }],
+        Period::parse("2024-03-01", "2024-03-01").unwrap(),
+        &MetricsConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(report.windows.len(), 1);
+    assert_eq!(report.windows[0].days, 1);
+    assert_eq!(
+        report.windows[0].previous_period.from.to_string(),
+        "2024-02-29"
+    );
+}
+
+#[test]
+fn custom_period_rejects_incomplete_collection_and_unrepresentable_previous_dates() {
+    let mut data = activity(Source::GitHub, "alice");
+    data.period = Period::parse("2026-10-26", "2026-10-30").unwrap();
+    assert!(
+        calculate_period(
+            &[data],
+            Period::parse("2026-10-28", "2026-10-30").unwrap(),
+            &MetricsConfig::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        collect_period(
+            &[],
+            Period::parse("0000-01-01", "0000-01-01").unwrap(),
+            &MetricsConfig::default(),
+        )
+        .is_err()
+    );
 }
 
 impl ActivitySource for FixedSource {
