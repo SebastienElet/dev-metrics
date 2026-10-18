@@ -592,3 +592,59 @@ fn github_retries_rate_limits_and_server_errors_even_when_the_body_is_truncated(
         success.assert();
     }
 }
+
+#[test]
+fn independent_github_batches_share_a_global_limit_of_eight_http_requests() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let mut server = Server::new();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let active_writer = active.clone();
+    let peak_writer = peak.clone();
+    let mock = server
+        .mock("GET", "/resource")
+        .with_chunked_body(move |writer| {
+            peak_writer.fetch_max(
+                active_writer.fetch_add(1, Ordering::SeqCst) + 1,
+                Ordering::SeqCst,
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            let result = writer.write_all(b"{}");
+            active_writer.fetch_sub(1, Ordering::SeqCst);
+            result
+        })
+        .expect(16)
+        .create();
+    let quota = RateLimit::default();
+    let client = Client::new();
+    std::thread::scope(|scope| {
+        let tasks = (0..16)
+            .map(|_| {
+                scope.spawn(|| {
+                    send(
+                        || client.get(format!("{}/resource", server.url())),
+                        Source::GitHub,
+                        "/resource",
+                        "GET",
+                        &|_| {},
+                        Some(&quota),
+                    )
+                    .unwrap()
+                    .status()
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            assert_eq!(task.join().unwrap(), 200);
+        }
+    });
+    assert!(
+        (2..=8).contains(&peak.load(Ordering::SeqCst)),
+        "peak={}",
+        peak.load(Ordering::SeqCst)
+    );
+    mock.assert();
+}

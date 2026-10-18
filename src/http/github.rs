@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const WAIT_BUDGET: Duration = Duration::from_secs(300);
@@ -101,6 +101,8 @@ struct Limits {
 
 pub(crate) struct RateLimit {
     limits: Mutex<Limits>,
+    in_flight: Mutex<usize>,
+    available: Condvar,
     clock: Arc<dyn Clock>,
 }
 
@@ -114,7 +116,43 @@ impl RateLimit {
     pub(super) fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             limits: Mutex::default(),
+            in_flight: Mutex::default(),
+            available: Condvar::new(),
             clock,
+        }
+    }
+
+    fn limit(&self, resource: Resource) -> Option<Limit> {
+        let limits = self.limits.lock().unwrap();
+        [limits.primary.get(&resource), limits.secondary.as_ref()]
+            .into_iter()
+            .flatten()
+            .max_by_key(|limit| (limit.stopped, limit.error.resume_at))
+            .cloned()
+    }
+
+    fn request_slot(
+        &self,
+        resource: Resource,
+        progress: &impl Fn(Event),
+        waited: &mut Duration,
+    ) -> Result<RequestSlot<'_>, Box<dyn Error>> {
+        loop {
+            self.wait(resource, progress, waited)?;
+            let mut count = self.in_flight.lock().unwrap();
+            while *count >= 8 {
+                count = self.available.wait(count).unwrap();
+            }
+            *count += 1;
+            drop(count);
+            let slot = RequestSlot(self);
+            if self.limit(resource).is_some_and(|limit| {
+                limit.stopped || limit.error.resume_at.is_none_or(|at| at > self.clock.now())
+            }) {
+                drop(slot);
+                continue;
+            }
+            return Ok(slot);
         }
     }
 
@@ -144,14 +182,7 @@ impl RateLimit {
         waited: &mut Duration,
     ) -> Result<(), Box<dyn Error>> {
         loop {
-            let limit = {
-                let limits = self.limits.lock().unwrap();
-                [limits.primary.get(&resource), limits.secondary.as_ref()]
-                    .into_iter()
-                    .flatten()
-                    .max_by_key(|limit| (limit.stopped, limit.error.resume_at))
-                    .cloned()
-            };
+            let limit = self.limit(resource);
             let Some(limit) = limit else {
                 return Ok(());
             };
@@ -199,6 +230,14 @@ impl RateLimit {
     }
 }
 
+struct RequestSlot<'a>(&'a RateLimit);
+impl Drop for RequestSlot<'_> {
+    fn drop(&mut self) {
+        *self.0.in_flight.lock().unwrap() -= 1;
+        self.0.available.notify_one();
+    }
+}
+
 pub(crate) struct Response {
     status: StatusCode,
     headers: HeaderMap,
@@ -230,7 +269,7 @@ pub(crate) fn send(
     let resource = Resource::for_operation(operation);
     let mut waited = Duration::ZERO;
     for attempt in 0..4 {
-        quota.wait(resource, progress, &mut waited)?;
+        let slot = quota.request_slot(resource, progress, &mut waited)?;
         progress(Event::Request {
             source,
             operation,
@@ -294,6 +333,7 @@ pub(crate) fn send(
                     .map(Duration::from_secs)
                     .unwrap_or(Duration::from_millis(250 * (1 << attempt)));
                 if delay <= WAIT_BUDGET.saturating_sub(waited) {
+                    drop(slot);
                     quota.clock.sleep(delay);
                     waited += delay;
                     continue;

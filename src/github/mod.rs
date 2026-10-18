@@ -113,6 +113,26 @@ impl Collector {
         {
             return Err("Utilisateur GitHub invalide".into());
         }
+        std::thread::scope(|scope| {
+            let commits = scope.spawn(|| {
+                self.commit_activity(user, period.clone())
+                    .map_err(|error| error.to_string())
+            });
+            let pulls = self.pull_request_activity(user, period.clone());
+            let commits = commits.join().map_err(|_| "Collecte GitHub interrompue")?;
+            let mut activity = pulls?;
+            let commits = commits?;
+            activity.commits = commits.commits;
+            activity.warnings.extend(commits.warnings);
+            Ok(activity)
+        })
+    }
+
+    fn pull_request_activity(
+        &self,
+        user: &str,
+        period: Period,
+    ) -> Result<Activity, Box<dyn Error>> {
         let mut activity = Activity::empty(Source::GitHub, user, period);
         let mut candidates = BTreeMap::new();
         let queries = [
@@ -147,7 +167,7 @@ impl Collector {
             kind: "PRs et issues",
             count: candidates.len(),
         });
-        let snapshots = graphql::snapshots(&self.api, &candidates)?;
+        let snapshots = graphql::snapshots(&self.api, &candidates, user, &activity.period)?;
         activity.warnings.extend(snapshots.warnings);
         let mut snapshots = snapshots.items;
         let discussions = candidates
@@ -196,6 +216,7 @@ impl Collector {
             }
         }
         let mut relevant = Vec::new();
+        let mut prefetched_files = BTreeMap::new();
         let total = candidates
             .keys()
             .map(|(repository, _)| repository)
@@ -234,6 +255,9 @@ impl Collector {
             let Some(snapshot) = snapshots.remove(&(repository.clone(), number)) else {
                 continue;
             };
+            if let Some(files) = snapshot.files {
+                prefetched_files.insert((repository.clone(), number), files);
+            }
             self.record_comments(
                 &mut activity,
                 &repository,
@@ -323,7 +347,7 @@ impl Collector {
             .iter()
             .map(|(repository, number, ..)| (repository.clone(), *number))
             .collect::<Vec<_>>();
-        let graph_files = graphql::files(&self.api, &keys, &candidates)?;
+        let graph_files = graphql::files(&self.api, &keys, &candidates, &prefetched_files)?;
         let unavailable = graph_files
             .warnings
             .iter()
@@ -441,6 +465,31 @@ impl Collector {
                 activity.warnings.extend(collected.warnings);
             }
         }
+        let unavailable = activity
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == WarningCode::ItemUnavailable)
+            .filter_map(|warning| match warning.subject {
+                WarningSubject::PullRequest { number } => {
+                    Some((warning.repository.clone(), number))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        activity.comments.retain(|comment| {
+            !unavailable.contains(&(comment.repository.clone(), comment.issue_number))
+        });
+        activity.reviews_given.retain(|review| {
+            !unavailable.contains(&(review.repository.clone(), review.pull_request_number))
+        });
+        activity.reviews_received.retain(|review| {
+            !unavailable.contains(&(review.repository.clone(), review.pull_request_number))
+        });
+        Ok(activity)
+    }
+
+    fn commit_activity(&self, user: &str, period: Period) -> Result<Activity, Box<dyn Error>> {
+        let mut activity = Activity::empty(Source::GitHub, user, period);
         let query = format!(
             "author:{user} author-date:{}..{}",
             activity.period.from, activity.period.to
@@ -502,26 +551,6 @@ impl Collector {
                 activity.warnings.extend(collected.warnings);
             }
         }
-        let unavailable = activity
-            .warnings
-            .iter()
-            .filter(|warning| warning.code == WarningCode::ItemUnavailable)
-            .filter_map(|warning| match warning.subject {
-                WarningSubject::PullRequest { number } => {
-                    Some((warning.repository.clone(), number))
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        activity.comments.retain(|comment| {
-            !unavailable.contains(&(comment.repository.clone(), comment.issue_number))
-        });
-        activity.reviews_given.retain(|review| {
-            !unavailable.contains(&(review.repository.clone(), review.pull_request_number))
-        });
-        activity.reviews_received.retain(|review| {
-            !unavailable.contains(&(review.repository.clone(), review.pull_request_number))
-        });
         Ok(activity)
     }
 

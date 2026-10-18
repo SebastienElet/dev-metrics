@@ -177,12 +177,15 @@ fn exhausted_quota_on_success_delays_the_next_request() {
         .unwrap()
         .as_secs()
         + 2;
+    let issue = |number| json!({"number":number,"repository_url":"https://api.github.com/repos/team/project","user":{"login":"octocat"},"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-02T00:00:00Z","comments":0});
     let first = server
         .mock("GET", "/search/issues")
         .match_query(Matcher::Any)
         .with_header("x-ratelimit-remaining", "0")
         .with_header("x-ratelimit-reset", &reset.to_string())
-        .with_body(empty.clone())
+        .with_body(
+            json!({"total_count":2,"incomplete_results":false,"items":[issue(1)]}).to_string(),
+        )
         .expect(1)
         .create();
     let remaining = server
@@ -190,6 +193,14 @@ fn exhausted_quota_on_success_delays_the_next_request() {
         .match_query(Matcher::Any)
         .with_body(empty.clone())
         .expect(3)
+        .create();
+    let second = server
+        .mock("GET", "/search/issues")
+        .match_query(Matcher::UrlEncoded("page".into(), "2".into()))
+        .with_body(
+            json!({"total_count":2,"incomplete_results":false,"items":[issue(2)]}).to_string(),
+        )
+        .expect(1)
         .create();
     server
         .mock("GET", "/search/commits")
@@ -206,6 +217,7 @@ fn exhausted_quota_on_success_delays_the_next_request() {
         .unwrap();
     first.assert();
     remaining.assert();
+    second.assert();
     assert!(started.elapsed() >= std::time::Duration::from_secs(1));
 }
 
@@ -433,4 +445,192 @@ fn full_commit_search_pages_are_fetched_concurrently_and_partial_results_still_f
         .to_string();
     assert!(error.contains("incomplète"), "{error}");
     assert_eq!(peak.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn fetches_files_with_metadata_for_pull_requests_known_to_be_relevant() {
+    for change_type in ["MODIFIED", "RENAMED", "PAGINATED"] {
+        let mut server = Server::new();
+        discovery(&mut server, 2);
+        let mut pulls = [pull_request(1), pull_request(2)];
+        for pull in &mut pulls {
+            pull["files"] = connection(vec![
+                json!({"filename":"src/lib.rs","additions":3,"deletions":1,"changeType":change_type}),
+            ]);
+        }
+        if change_type == "PAGINATED" {
+            for pull in &mut pulls {
+                pull["files"]["pageInfo"]["hasNextPage"] = json!(true);
+            }
+        }
+        let mut rest = Vec::new();
+        for number in 1..=2 {
+            rest.push(server.mock("GET", format!("/repos/team/project/pulls/{number}/files").as_str()).match_query(Matcher::Any)
+            .with_body(json!([{"filename":"src/lib.rs","previous_filename":"old.rs","additions":3,"deletions":1}]).to_string())
+            .expect(usize::from(change_type != "MODIFIED")).create());
+        }
+        let metadata = server
+            .mock("POST", "/graphql")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::PartialJson(json!({"operationName":"PullRequestActivity"})),
+                Matcher::Regex("files\\(first:100\\)".into()),
+            ]))
+            .with_body(
+                json!({"data":{"p0":{"pullRequest":pulls[0]},"p1":{"pullRequest":pulls[1]}}})
+                    .to_string(),
+            )
+            .expect(1)
+            .create();
+        let files = server
+            .mock("POST", "/graphql")
+            .match_body(Matcher::PartialJson(
+                json!({"operationName":"PullRequestFiles"}),
+            ))
+            .with_body(json!({"data":{}}).to_string())
+            .expect(0)
+            .create();
+        let activity = GitHubSource::new(server.url().parse().unwrap(), "test-token")
+            .unwrap()
+            .activity(
+                "octocat",
+                Period::parse("2026-10-01", "2026-10-07").unwrap(),
+            )
+            .unwrap();
+        assert_eq!(activity.pull_requests.len(), 2);
+        assert!(
+            activity
+                .pull_requests
+                .iter()
+                .all(|pull| pull.files.len() == 1)
+        );
+        assert!(activity.warnings.is_empty());
+        metadata.assert();
+        files.assert();
+        for request in rest {
+            request.assert();
+        }
+    }
+}
+
+#[test]
+fn paginated_pull_requests_from_one_graphql_batch_load_independently() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let mut server = Server::new();
+    discovery(&mut server, 2);
+    let mut pulls = [pull_request(1), pull_request(2)];
+    for pull in &mut pulls {
+        pull["reviews"]["pageInfo"]["hasNextPage"] = json!(true);
+        pull["files"] = connection(vec![
+            json!({"filename":"src/lib.rs","additions":3,"deletions":1,"changeType":"MODIFIED"}),
+        ]);
+    }
+    server
+        .mock("POST", "/graphql")
+        .with_body(
+            json!({"data":{"p0":{"pullRequest":pulls[0]},"p1":{"pullRequest":pulls[1]}}})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    for number in 1..=2 {
+        for endpoint in ["comments", "reviews"] {
+            let active = active.clone();
+            let peak = peak.clone();
+            server
+                .mock(
+                    "GET",
+                    format!("/repos/team/project/pulls/{number}/{endpoint}").as_str(),
+                )
+                .match_query(Matcher::Any)
+                .with_chunked_body(move |writer| {
+                    peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    let result = writer.write_all(b"[]");
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    result
+                })
+                .expect(1)
+                .create();
+        }
+    }
+    let activity = GitHubSource::new(server.url().parse().unwrap(), "test-token")
+        .unwrap()
+        .activity(
+            "octocat",
+            Period::parse("2026-10-01", "2026-10-07").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(activity.pull_requests.len(), 2);
+    assert!(activity.warnings.is_empty());
+    assert_eq!(peak.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn pull_requests_and_commits_are_collected_concurrently() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let mut server = Server::new();
+    discovery(&mut server, 1);
+    let active = Arc::new(AtomicUsize::new(0));
+    let overlapped = Arc::new(AtomicBool::new(false));
+    let mut pull = pull_request(1);
+    pull["files"] = connection(vec![
+        json!({"filename":"src/lib.rs","additions":3,"deletions":1,"changeType":"MODIFIED"}),
+    ]);
+    let body = json!({"data":{"p0":{"pullRequest":pull}}}).to_string();
+    let pr_active = active.clone();
+    let pr_overlap = overlapped.clone();
+    let metadata = server
+        .mock("POST", "/graphql")
+        .with_chunked_body(move |writer| {
+            if pr_active.fetch_add(1, Ordering::SeqCst) > 0 {
+                pr_overlap.store(true, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let result = writer.write_all(body.as_bytes());
+            pr_active.fetch_sub(1, Ordering::SeqCst);
+            result
+        })
+        .expect(1)
+        .create();
+    let sha = "a".repeat(40);
+    server.mock("GET", "/search/commits").match_query(Matcher::Any)
+        .with_body(json!({"total_count":1,"incomplete_results":false,"items":[{"sha":sha,"repository":{"full_name":"team/project"}}]}).to_string()).expect(1).create();
+    let body = json!({"sha":sha,"html_url":"https://github.com/team/project/commit/a","commit":{"message":"Change","author":{"date":"2026-10-02T00:00:00Z"}},"stats":{"additions":0,"deletions":0},"files":[]}).to_string();
+    let seen = overlapped.clone();
+    let commit = server
+        .mock("GET", format!("/repos/team/project/commits/{sha}").as_str())
+        .match_query(Matcher::Any)
+        .with_chunked_body(move |writer| {
+            if active.fetch_add(1, Ordering::SeqCst) > 0 {
+                seen.store(true, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let result = writer.write_all(body.as_bytes());
+            active.fetch_sub(1, Ordering::SeqCst);
+            result
+        })
+        .expect(1)
+        .create();
+    let activity = GitHubSource::new(server.url().parse().unwrap(), "test-token")
+        .unwrap()
+        .activity(
+            "octocat",
+            Period::parse("2026-10-01", "2026-10-07").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        (activity.pull_requests.len(), activity.commits.len()),
+        (1, 1)
+    );
+    assert!(overlapped.load(Ordering::SeqCst));
+    metadata.assert();
+    commit.assert();
 }
