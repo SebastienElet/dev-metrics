@@ -102,10 +102,13 @@ impl Api {
                 },
                 Source::Bitbucket,
                 operation,
-                &self.progress,
+                &|event| self.progress.emit(event),
             )
             .map_err(|error| {
-                if error.is_timeout() {
+                if error
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_timeout)
+                {
                     "Bitbucket : timeout"
                 } else {
                     "Bitbucket : échec réseau"

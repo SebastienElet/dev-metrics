@@ -30,13 +30,24 @@ fn main() -> ExitCode {
                 Command::Config {
                     action: ConfigAction::Check { format },
                 } => run_config_check(&cli, *format),
-                _ => run(
-                    &progress,
-                    cli,
-                    DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive(),
-                    |kind, config, workspace| load_source(kind, config, workspace, &progress),
-                )
-                .map(|output| (output, 0)),
+                _ => {
+                    let cache = (!cli.no_cache)
+                        .then(|| {
+                            std::env::var_os("HOME").map(|home| {
+                                std::path::PathBuf::from(home).join(".cache/dev-metrics")
+                            })
+                        })
+                        .flatten();
+                    run(
+                        &progress,
+                        cli,
+                        DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive(),
+                        |kind, config, workspace| {
+                            load_source(kind, config, workspace, &progress, cache.as_deref())
+                        },
+                    )
+                    .map(|output| (output, 0))
+                }
             }
         }
         Err(error)
@@ -311,6 +322,7 @@ fn load_source(
     config: &Config,
     workspace: Option<&str>,
     progress: &Progress,
+    cache: Option<&std::path::Path>,
 ) -> Result<Box<dyn ActivitySource>, CommandError> {
     let auth_error = |error: Box<dyn std::error::Error>| {
         CommandError::new(ErrorCode::AuthenticationError, error).source(kind.as_str())
@@ -328,6 +340,10 @@ fn load_source(
                 &token,
             )
             .map(|source| {
+                let source = match cache {
+                    Some(directory) => source.with_cache(directory.into()),
+                    None => source,
+                };
                 Box::new(source.with_progress(progress.clone())) as Box<dyn ActivitySource>
             })
             .map_err(auth_error)

@@ -1,12 +1,12 @@
 mod api;
 mod auth;
+mod cache;
+mod graphql;
+mod parallel;
 
 pub use crate::activity::*;
 use crate::progress::{Event, Progress};
-use api::{
-    Api, CommentDetail, CommitDetail, CommitReference, FileDetail, Issue, PullRequestDetail,
-    ReviewDetail,
-};
+use api::{Api, CommentDetail, CommitDetail, CommitReference, FileDetail, Issue};
 pub use auth::resolve_token;
 use reqwest::Url;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +14,7 @@ use std::error::Error;
 
 pub struct GitHubSource {
     api: Api,
+    progress: Progress,
 }
 
 impl ActivitySource for GitHubSource {
@@ -35,25 +36,76 @@ impl ActivitySource for GitHubSource {
 }
 
 impl GitHubSource {
+    pub fn with_cache(mut self, directory: std::path::PathBuf) -> Self {
+        self.api.cache = Some(cache::Cache { directory });
+        self
+    }
+
     pub fn with_progress(mut self, progress: Progress) -> Self {
-        self.api.progress = progress;
+        self.progress = progress;
         self
     }
 
     pub fn new(api_base: Url, token: &str) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
             api: Api::new(api_base, token)?,
+            progress: Progress::default(),
+        })
+    }
+
+    fn run<T: Send>(
+        &self,
+        collect: impl FnOnce(Collector) -> Result<T, Box<dyn Error>> + Send,
+    ) -> Result<T, Box<dyn Error>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut api = self.api.clone();
+        api.events = Some(sender);
+        std::thread::scope(|scope| {
+            let task =
+                scope.spawn(move || collect(Collector { api }).map_err(|error| error.to_string()));
+            let mut calls = BTreeMap::new();
+            let mut waited = std::time::Duration::ZERO;
+            for event in receiver {
+                match &event {
+                    Event::Request { operation, .. } => *calls.entry(*operation).or_default() += 1,
+                    Event::Waited { elapsed, .. } => waited += *elapsed,
+                    _ => {}
+                }
+                self.progress.emit(event);
+            }
+            self.progress.emit(Event::Statistics {
+                source: Source::GitHub,
+                calls,
+                waited,
+            });
+            task.join()
+                .map_err(|_| "Collecte GitHub interrompue")?
+                .map_err(Into::into)
         })
     }
 
     pub fn authenticated_user(&self) -> Result<String, Box<dyn Error>> {
-        self.api.progress.emit(Event::Identifying(Source::GitHub));
+        self.run(|collector| collector.authenticated_user())
+    }
+
+    pub fn activity(&self, user: &str, period: Period) -> Result<Activity, Box<dyn Error>> {
+        self.run(|collector| collector.activity(user, period))
+    }
+}
+
+struct Collector {
+    api: Api,
+}
+
+impl Collector {
+    fn authenticated_user(&self) -> Result<String, Box<dyn Error>> {
+        self.api.emit(Event::Identifying(Source::GitHub));
         let (user, _): (api::User, _) = self.api.get("user", &[])?;
         Ok(user.login)
     }
 
     pub fn activity(&self, user: &str, period: Period) -> Result<Activity, Box<dyn Error>> {
-        self.api.progress.emit(Event::Source(Source::GitHub));
+        self.api.emit(Event::Source(Source::GitHub));
         if user.is_empty()
             || user.len() > 39
             || !user.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
@@ -62,68 +114,131 @@ impl GitHubSource {
         }
         let mut activity = Activity::empty(Source::GitHub, user, period);
         let mut candidates = BTreeMap::new();
-        for query in [
-            format!("is:pr author:{user} updated:>={}", activity.period.from),
+        let queries = [
+            format!("is:pr author:{user}"),
+            format!("is:pr reviewed-by:{user}"),
+            format!("is:pr commenter:{user}"),
+            format!("is:issue commenter:{user}"),
+        ]
+        .map(|query| {
             format!(
-                "is:pr reviewed-by:{user} updated:>={}",
-                activity.period.from
-            ),
-            format!("is:pr commenter:{user} updated:>={}", activity.period.from),
-            format!(
-                "is:issue commenter:{user} updated:>={}",
-                activity.period.from
-            ),
-        ] {
+                "{query} updated:>={} created:<={}",
+                activity.period.from, activity.period.to
+            )
+        });
+        let searches = parallel::collect(queries.into(), |query| {
+            self.api.search::<Issue>("search/issues", &query)
+        })?;
+        for issues in searches {
             let mut query_keys = BTreeSet::new();
-            for issue in self.api.search::<Issue>("search/issues", &query)? {
+            for issue in issues {
                 let repository = issue.repository()?;
                 if !query_keys.insert((repository.clone(), issue.number)) {
                     return Err(
                         "Recherche GitHub avec résultats dupliqués ; relancez la collecte".into(),
                     );
                 }
-                candidates.insert((repository, issue.number), issue.pull_request.is_some());
+                candidates.insert((repository, issue.number), issue);
             }
         }
+        self.api.emit(Event::Candidates {
+            source: Source::GitHub,
+            kind: "PRs et issues",
+            count: candidates.len(),
+        });
+        let mut snapshots = graphql::snapshots(&self.api, &candidates)?;
+        let discussions = candidates
+            .iter()
+            .filter(|(_, issue)| issue.pull_request.is_none() && issue.comments > 0)
+            .collect::<Vec<_>>();
+        let mut discussions = parallel::collect(discussions, |(key, issue)| {
+            let slot = self
+                .api
+                .cache_key(&format!("{}/{}/discussion", key.0, key.1));
+            let version = format!("{slot}/{}", issue.updated_at);
+            let comments = match self
+                .api
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.read::<Vec<CommentDetail>>(&slot, &version))
+            {
+                Some(comments) => comments,
+                None => {
+                    let comments: Vec<CommentDetail> = self
+                        .api
+                        .list(&format!("repos/{}/issues/{}/comments", key.0, key.1))?;
+                    if let Some(cache) = &self.api.cache {
+                        cache.write(&slot, &version, &comments);
+                    }
+                    comments
+                }
+            };
+            Ok((key.clone(), comments))
+        })?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let mut relevant = Vec::new();
         let total = candidates
             .keys()
             .map(|(repository, _)| repository)
             .collect::<BTreeSet<_>>()
             .len();
         let mut visited = BTreeSet::new();
-        self.api.progress.emit(Event::Repositories {
+        self.api.emit(Event::Repositories {
             source: Source::GitHub,
             stage: "PRs et commentaires",
             current: 0,
             total,
         });
-        for ((repository, number), is_pr) in candidates {
+        for ((repository, number), issue) in &candidates {
+            let repository = repository.clone();
+            let number = *number;
             if visited.insert(repository.clone()) {
-                self.api.progress.emit(Event::Repositories {
+                self.api.emit(Event::Repositories {
                     source: Source::GitHub,
                     stage: "PRs et commentaires",
                     current: visited.len(),
                     total,
                 });
             }
-            self.comments(&mut activity, &repository, number, CommentKind::Discussion)?;
-            if !is_pr {
+            if issue.pull_request.is_none() {
+                if let Some(comments) = discussions.remove(&(repository.clone(), number)) {
+                    self.record_comments(
+                        &mut activity,
+                        &repository,
+                        number,
+                        CommentKind::Discussion,
+                        comments,
+                    );
+                }
                 continue;
             }
-            self.comments(&mut activity, &repository, number, CommentKind::Review)?;
-            let endpoint = format!("repos/{repository}/pulls/{number}");
-            let (detail, _): (PullRequestDetail, _) = self.api.get(&endpoint, &[])?;
-            let author = detail.user.map(|u| u.login);
+            let snapshot = snapshots
+                .remove(&(repository.clone(), number))
+                .ok_or("Données de PR absentes")?;
+            self.record_comments(
+                &mut activity,
+                &repository,
+                number,
+                CommentKind::Discussion,
+                snapshot.discussion,
+            );
+            self.record_comments(
+                &mut activity,
+                &repository,
+                number,
+                CommentKind::Review,
+                snapshot.inline,
+            );
+            let detail = snapshot.detail;
+            let author = detail.user.as_ref().map(|u| u.login.clone());
             let owned = author
                 .as_deref()
                 .is_some_and(|a| a.eq_ignore_ascii_case(user));
             let mut first_review_received_at = None;
             let mut reviewed_in_period = false;
             let mut received_in_period = false;
-            for review in self
-                .api
-                .list::<ReviewDetail>(&format!("{endpoint}/reviews"))?
-            {
+            for review in snapshot.reviews {
                 if review.state == ReviewState::Pending {
                     continue;
                 }
@@ -183,9 +298,22 @@ impl GitHubSource {
                 .any(|c| c.repository == repository && c.issue_number == number);
             if authored_in_period || reviewed_in_period || received_in_period || commented_in_period
             {
+                relevant.push((repository, number, detail, author, first_review_received_at));
+            }
+        }
+        let keys = relevant
+            .iter()
+            .map(|(repository, number, ..)| (repository.clone(), *number))
+            .collect::<Vec<_>>();
+        let graph_files = graphql::files(&self.api, &keys, &candidates)?;
+        let pulls = parallel::collect(
+            relevant,
+            |(repository, number, detail, author, first_review_received_at)| {
+                let mut collected = Activity::empty(Source::GitHub, user, activity.period.clone());
+                let endpoint = format!("repos/{repository}/pulls/{number}");
                 let subject = WarningSubject::PullRequest { number };
                 if detail.changed_files > 3000 {
-                    activity.warnings.push(warning(
+                    collected.warnings.push(warning(
                         &repository,
                         &subject,
                         WarningCode::FileLimitReached,
@@ -195,43 +323,54 @@ impl GitHubSource {
                         ),
                     ));
                 }
-                let mut files = Vec::new();
-                for page_number in 1..=30 {
-                    let (page, next): (Vec<FileDetail>, _) = self.api.get(
-                        &format!("{endpoint}/files"),
-                        &[
-                            ("per_page", "100".into()),
-                            ("page", page_number.to_string()),
-                        ],
-                    )?;
-                    let empty = page.is_empty();
-                    files.extend(page);
-                    if !next {
-                        break;
+                let mut files = graph_files.get(&(repository.clone(), number)).cloned();
+                if files.is_none() {
+                    let warnings_before = collected.warnings.len();
+                    let mut pages = Vec::new();
+                    for page_number in 1..=30 {
+                        let (page, next): (Vec<FileDetail>, _) = self.api.get(
+                            &format!("{endpoint}/files"),
+                            &[
+                                ("per_page", "100".into()),
+                                ("page", page_number.to_string()),
+                            ],
+                        )?;
+                        let empty = page.is_empty();
+                        pages.extend(page);
+                        if !next {
+                            break;
+                        }
+                        if empty || pages.len() >= 3000 || page_number == 30 {
+                            collected.warnings.push(warning(
+                                &repository,
+                                &subject,
+                                WarningCode::FilePaginationIncomplete,
+                                "Pagination des fichiers de PR interrompue avant la dernière page",
+                            ));
+                            break;
+                        }
                     }
-                    if empty || files.len() >= 3000 || page_number == 30 {
-                        activity.warnings.push(warning(
-                            &repository,
-                            &subject,
-                            WarningCode::FilePaginationIncomplete,
-                            "Pagination des fichiers de PR interrompue avant la dernière page",
-                        ));
-                        break;
+                    if collected.warnings.len() == warnings_before
+                        && detail.changed_files == pages.len()
+                    {
+                        let key = (repository.clone(), number);
+                        graphql::cache_files(&self.api, &key, &candidates[&key], &pages);
                     }
+                    files = Some(pages);
                 }
                 let files = file_changes(
-                    &mut activity,
+                    &mut collected,
                     &repository,
                     &subject,
-                    files,
+                    files.unwrap(),
                     detail.additions,
                     detail.deletions,
                 );
                 if detail.changed_files != files.len() {
-                    activity.warnings.push(warning(&repository, &subject, WarningCode::FileCountMismatch,
+                    collected.warnings.push(warning(&repository, &subject, WarningCode::FileCountMismatch,
                         format!("{} fichiers annoncés, {} fichiers disponibles ; exclusions limitées aux fichiers disponibles", detail.changed_files, files.len())));
                 }
-                activity.pull_requests.push(PullRequest {
+                collected.pull_requests.push(PullRequest {
                     source: Source::GitHub,
                     repository,
                     number: detail.number,
@@ -245,7 +384,12 @@ impl GitHubSource {
                     deletions: detail.deletions,
                     files,
                 });
-            }
+                Ok(collected)
+            },
+        )?;
+        for collected in pulls {
+            activity.pull_requests.extend(collected.pull_requests);
+            activity.warnings.extend(collected.warnings);
         }
         let query = format!(
             "author:{user} author-date:{}..{}",
@@ -262,122 +406,136 @@ impl GitHubSource {
                 );
             }
         }
+        self.api.emit(Event::Candidates {
+            source: Source::GitHub,
+            kind: "commits",
+            count: commit_keys.len(),
+        });
         let total = commit_keys
             .iter()
             .map(|(repository, _)| repository)
             .collect::<BTreeSet<_>>()
             .len();
-        let mut visited = BTreeSet::new();
-        self.api.progress.emit(Event::Repositories {
+        self.api.emit(Event::Repositories {
             source: Source::GitHub,
             stage: "commits",
             current: 0,
             total,
         });
-        for (repository, sha) in commit_keys {
-            if visited.insert(repository.clone()) {
-                self.api.progress.emit(Event::Repositories {
-                    source: Source::GitHub,
-                    stage: "commits",
-                    current: visited.len(),
-                    total,
-                });
-            }
-            api::validate_repository(&repository)?;
-            if sha.is_empty() || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-                return Err("SHA GitHub invalide".into());
-            }
-            let endpoint = format!("repos/{repository}/commits/{sha}");
-            let (mut detail, mut next): (CommitDetail, _) = self.api.get(
-                &endpoint,
-                &[("per_page", "100".into()), ("page", "1".into())],
-            )?;
-            let subject = WarningSubject::Commit { sha: sha.clone() };
-            let mut number = 2;
-            while next {
-                if detail.files.len() >= 3000 {
-                    break;
-                }
-                if detail.files.is_empty() || number > 30 {
-                    activity.warnings.push(warning(
-                        &repository,
-                        &subject,
-                        WarningCode::FilePaginationIncomplete,
-                        "Pagination des fichiers de commit interrompue avant la dernière page",
-                    ));
-                    break;
-                }
-                let (page, more): (CommitDetail, _) = self.api.get(
-                    &endpoint,
-                    &[("per_page", "100".into()), ("page", number.to_string())],
-                )?;
-                if page.sha != detail.sha
-                    || page.stats.additions != detail.stats.additions
-                    || page.stats.deletions != detail.stats.deletions
-                {
-                    activity.warnings.push(warning(&repository, &subject, WarningCode::FilePaginationInconsistent,
-                        "Métadonnées de commit différentes entre les pages ; totaux de la première page conservés"));
-                }
-                if page.sha != detail.sha {
-                    break;
-                }
-                if page.files.is_empty() {
-                    activity.warnings.push(warning(
-                        &repository,
-                        &subject,
-                        WarningCode::FilePaginationIncomplete,
-                        "Page de fichiers de commit vide après une page annonçant une suite",
-                    ));
-                    break;
-                }
-                detail.files.extend(page.files);
-                next = more;
-                number += 1;
-            }
-            if detail.files.len() >= 3000 {
-                activity.warnings.push(warning(
-                    &repository,
-                    &subject,
-                    WarningCode::FileLimitReached,
-                    "Limite GitHub de 3000 fichiers atteinte ; le diff peut être tronqué",
-                ));
-            }
-            let files = file_changes(
-                &mut activity,
-                &repository,
-                &subject,
-                detail.files,
-                detail.stats.additions,
-                detail.stats.deletions,
-            );
-            activity.commits.push(Commit {
-                source: Source::GitHub,
-                repository,
-                sha: detail.sha,
-                message: detail.commit.message,
-                url: detail.html_url,
-                authored_at: detail.commit.author.date,
-                additions: detail.stats.additions,
-                deletions: detail.stats.deletions,
-                files,
-            });
+        let commits = parallel::collect(commit_keys.into_iter().collect(), |(repository, sha)| {
+            self.commit(user, &activity.period, repository, sha)
+        })?;
+        self.api.emit(Event::Repositories {
+            source: Source::GitHub,
+            stage: "commits",
+            current: total,
+            total,
+        });
+        for collected in commits {
+            activity.commits.extend(collected.commits);
+            activity.warnings.extend(collected.warnings);
         }
         Ok(activity)
     }
 
-    fn comments(
+    fn commit(
+        &self,
+        user: &str,
+        period: &Period,
+        repository: String,
+        sha: String,
+    ) -> Result<Activity, Box<dyn Error>> {
+        let mut activity = Activity::empty(Source::GitHub, user, period.clone());
+        api::validate_repository(&repository)?;
+        if sha.is_empty() || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err("SHA GitHub invalide".into());
+        }
+        let endpoint = format!("repos/{repository}/commits/{sha}");
+        let (mut detail, mut next): (CommitDetail, _) = self.api.get(
+            &endpoint,
+            &[("per_page", "100".into()), ("page", "1".into())],
+        )?;
+        let subject = WarningSubject::Commit { sha: sha.clone() };
+        let mut number = 2;
+        while next {
+            if detail.files.len() >= 3000 {
+                break;
+            }
+            if detail.files.is_empty() || number > 30 {
+                activity.warnings.push(warning(
+                    &repository,
+                    &subject,
+                    WarningCode::FilePaginationIncomplete,
+                    "Pagination des fichiers de commit interrompue avant la dernière page",
+                ));
+                break;
+            }
+            let (page, more): (CommitDetail, _) = self.api.get(
+                &endpoint,
+                &[("per_page", "100".into()), ("page", number.to_string())],
+            )?;
+            if page.sha != detail.sha
+                || page.stats.additions != detail.stats.additions
+                || page.stats.deletions != detail.stats.deletions
+            {
+                activity.warnings.push(warning(&repository, &subject, WarningCode::FilePaginationInconsistent,
+                        "Métadonnées de commit différentes entre les pages ; totaux de la première page conservés"));
+            }
+            if page.sha != detail.sha {
+                break;
+            }
+            if page.files.is_empty() {
+                activity.warnings.push(warning(
+                    &repository,
+                    &subject,
+                    WarningCode::FilePaginationIncomplete,
+                    "Page de fichiers de commit vide après une page annonçant une suite",
+                ));
+                break;
+            }
+            detail.files.extend(page.files);
+            next = more;
+            number += 1;
+        }
+        if detail.files.len() >= 3000 {
+            activity.warnings.push(warning(
+                &repository,
+                &subject,
+                WarningCode::FileLimitReached,
+                "Limite GitHub de 3000 fichiers atteinte ; le diff peut être tronqué",
+            ));
+        }
+        let files = file_changes(
+            &mut activity,
+            &repository,
+            &subject,
+            detail.files,
+            detail.stats.additions,
+            detail.stats.deletions,
+        );
+        activity.commits.push(Commit {
+            source: Source::GitHub,
+            repository,
+            sha: detail.sha,
+            message: detail.commit.message,
+            url: detail.html_url,
+            authored_at: detail.commit.author.date,
+            additions: detail.stats.additions,
+            deletions: detail.stats.deletions,
+            files,
+        });
+        Ok(activity)
+    }
+
+    fn record_comments(
         &self,
         activity: &mut Activity,
         repository: &str,
         number: u64,
         kind: CommentKind,
-    ) -> Result<(), Box<dyn Error>> {
-        let segment = match kind {
-            CommentKind::Discussion => "issues",
-            CommentKind::Review => "pulls",
-        };
-        let endpoint = format!("repos/{repository}/{segment}/{number}/comments");
-        for comment in self.api.list::<CommentDetail>(&endpoint)? {
+        comments: Vec<CommentDetail>,
+    ) {
+        for comment in comments {
             let Some(author) = comment.user.map(|u| u.login) else {
                 continue;
             };
@@ -397,7 +555,6 @@ impl GitHubSource {
                 kind,
             });
         }
-        Ok(())
     }
 }
 

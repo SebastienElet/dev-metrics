@@ -58,3 +58,9 @@ Pour les autres options et les commandes d'activité brute, consultez
 le schéma JSON du rapport pour les intégrations et les agents.
 
 `--quiet` désactive la progression ; `--verbose` détaille les appels API sur stderr, uniquement dans un terminal (`--quiet` prioritaire).
+
+La collecte GitHub regroupe les PR en lots GraphQL, avec au plus huit requêtes
+simultanées. `--verbose` affiche les candidats, les appels par endpoint et les attentes
+de limite de débit. Le cache local `~/.cache/dev-metrics` réutilise les PR et issues
+inchangées (`updated_at`) et les commits par SHA ; `--no-cache` désactive sa lecture
+et son écriture. Les recherches restent fraîches à chaque lancement.

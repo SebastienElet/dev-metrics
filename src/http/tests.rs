@@ -1,4 +1,5 @@
 use super::*;
+use crate::progress::Progress;
 use mockito::Server;
 use reqwest::blocking::Client;
 
@@ -32,7 +33,7 @@ fn retries_throttled_get_once_and_reports_wait_and_remaining_quota() {
             || client.get(format!("{}/resource", server.url())),
             source,
             "ressource",
-            &progress,
+            &|event| progress.emit(event),
         )
         .unwrap();
         assert_eq!(response.status(), 200);
@@ -59,7 +60,7 @@ fn repeated_throttling_stops_after_one_retry() {
         || client.get(format!("{}/resource", server.url())),
         Source::GitHub,
         "ressource",
-        &Progress::default(),
+        &|event| Progress::default().emit(event),
     )
     .unwrap();
     assert_eq!(response.status(), 429);
@@ -95,7 +96,7 @@ fn unusable_delays_and_other_errors_do_not_retry_or_echo_headers() {
             || client.get(format!("{}/resource", server.url())),
             source,
             "ressource",
-            &progress,
+            &|event| progress.emit(event),
         )
         .unwrap();
         assert_eq!(usize::from(response.status().as_u16()), status);
@@ -161,9 +162,12 @@ fn countdown_reports_remaining_time_and_preserves_waits_when_silent() {
         let log = tempfile::NamedTempFile::new().unwrap();
         let progress = Progress::new(log.reopen().unwrap(), terminal, false, false);
         let mut elapsed = Duration::ZERO;
-        wait_for_retry(&progress, Source::Bitbucket, 2, |duration| {
-            elapsed += duration
-        });
+        wait_for_retry(
+            &|event| progress.emit(event),
+            Source::Bitbucket,
+            2,
+            |duration| elapsed += duration,
+        );
         assert_eq!(elapsed, Duration::from_secs(2));
         let output = std::fs::read_to_string(log.path()).unwrap();
         if terminal {

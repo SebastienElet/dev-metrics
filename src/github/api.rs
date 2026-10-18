@@ -1,20 +1,29 @@
 use crate::activity::{ReviewState, Source};
-use crate::progress::{Event, Progress};
+use crate::progress::Event;
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, LINK};
 use reqwest::{Url, redirect, retry};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::error::Error;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub(super) struct Api {
     base: Url,
     client: Client,
-    pub progress: Progress,
+    quota: std::sync::Arc<crate::http::RateLimit>,
+    pub cache: Option<super::cache::Cache>,
+    pub events: Option<std::sync::mpsc::Sender<Event>>,
 }
 
 impl Api {
+    pub fn emit(&self, event: Event) {
+        if let Some(events) = &self.events {
+            let _ = events.send(event);
+        }
+    }
+
     pub fn new(base: Url, token: &str) -> Result<Self, Box<dyn Error>> {
         let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
             .map_err(|_| "Token GitHub invalide")?;
@@ -40,11 +49,13 @@ impl Api {
         Ok(Self {
             base,
             client,
-            progress: Progress::default(),
+            events: None,
+            cache: None,
+            quota: std::sync::Arc::default(),
         })
     }
 
-    pub fn get<T: DeserializeOwned>(
+    pub fn get<T: DeserializeOwned + Serialize>(
         &self,
         endpoint: &str,
         query: &[(&str, String)],
@@ -53,6 +64,18 @@ impl Api {
         if !query.is_empty() {
             url.query_pairs_mut()
                 .extend_pairs(query.iter().map(|(key, value)| (*key, value.as_str())));
+        }
+        let cache_key = self.cache_key(url.as_str());
+        let cache = self.cache.as_ref().filter(|_| {
+            matches!(
+                endpoint.split('/').collect::<Vec<_>>().as_slice(),
+                ["repos", _, _, "commits", _]
+            )
+        });
+        if let Some((body, next)) =
+            cache.and_then(|cache| cache.read::<(T, bool)>(&cache_key, &cache_key))
+        {
+            return Ok((body, next));
         }
         let operation = match endpoint.split('/').collect::<Vec<_>>().as_slice() {
             ["user"] => "identité",
@@ -70,26 +93,40 @@ impl Api {
             .find(|(key, _)| *key == "page")
             .and_then(|(_, value)| value.parse().ok())
         {
-            self.progress.emit(Event::Page {
+            self.emit(Event::Page {
                 source: Source::GitHub,
                 operation,
                 number,
             });
         }
-        let response = crate::http::get(
+        let response = crate::http::send(
             || self.client.get(url.clone()),
             Source::GitHub,
-            operation,
-            &self.progress,
+            match endpoint.split('/').collect::<Vec<_>>().as_slice() {
+                ["user"] => "/user",
+                ["search", "issues"] => "/search/issues",
+                ["search", "commits"] => "/search/commits",
+                ["repos", _, _, "pulls", _] => "/repos/{owner}/{repo}/pulls/{number}",
+                ["repos", _, _, "commits", _] => "/repos/{owner}/{repo}/commits/{sha}",
+                ["repos", _, _, "issues", _, "comments"] => {
+                    "/repos/{owner}/{repo}/issues/{number}/comments"
+                }
+                ["repos", _, _, "pulls", _, "comments"] => {
+                    "/repos/{owner}/{repo}/pulls/{number}/comments"
+                }
+                ["repos", _, _, "pulls", _, "reviews"] => {
+                    "/repos/{owner}/{repo}/pulls/{number}/reviews"
+                }
+                ["repos", _, _, "pulls", _, "files"] => {
+                    "/repos/{owner}/{repo}/pulls/{number}/files"
+                }
+                _ => "ressource",
+            },
+            "GET",
+            &|event| self.emit(event),
+            Some(&self.quota),
         )
-        .map_err(|error| {
-            let reason = if error.is_timeout() {
-                "timeout"
-            } else {
-                "échec réseau"
-            };
-            format!("GitHub {endpoint} : {reason}")
-        })?;
+        .map_err(|error| format!("GitHub {endpoint} : {}", request_error(error)))?;
         if !response.status().is_success() {
             return Err(format!("GitHub {endpoint} : HTTP {} (vérifiez le token, les permissions et les limites API)", response.status().as_u16()).into());
         }
@@ -99,28 +136,69 @@ impl Api {
             .map(|value| value.to_str())
             .transpose()?
             .is_some_and(|link| link.contains("rel=\"next\""));
-        let body = response
+        let body: T = response
             .json()
             .map_err(|_| format!("Réponse GitHub invalide pour {endpoint}"))?;
+        if let Some(cache) = cache {
+            cache.write(&cache_key, &cache_key, &(&body, next));
+        }
         Ok((body, next))
     }
 
-    pub fn search<T: DeserializeOwned>(
+    pub fn cache_key(&self, resource: &str) -> String {
+        format!("{}{resource}", self.base)
+    }
+
+    pub fn graphql<T: DeserializeOwned>(
+        &self,
+        operation: &str,
+        query: &str,
+    ) -> Result<T, Box<dyn Error>> {
+        let url = self.base.join("graphql")?;
+        let body = serde_json::json!({"operationName":operation,"query":query});
+        let response = crate::http::send(
+            || self.client.post(url.clone()).json(&body),
+            Source::GitHub,
+            "/graphql",
+            "POST",
+            &|event| self.emit(event),
+            Some(&self.quota),
+        )
+        .map_err(|error| format!("GitHub GraphQL : {}", request_error(error)))?;
+        if !response.status().is_success() {
+            return Err(format!("GitHub GraphQL : HTTP {}", response.status().as_u16()).into());
+        }
+        let envelope: GraphResponse<T> = response
+            .json()
+            .map_err(|_| "Réponse GitHub GraphQL invalide")?;
+        if envelope.errors.is_some_and(|errors| !errors.is_empty()) {
+            return Err("GitHub GraphQL : réponse partielle ou erreur de requête".into());
+        }
+        envelope
+            .data
+            .ok_or_else(|| "GitHub GraphQL : données absentes".into())
+    }
+
+    pub fn search<T: DeserializeOwned + Serialize + Send>(
         &self,
         endpoint: &str,
         query: &str,
     ) -> Result<Vec<T>, Box<dyn Error>> {
         let mut items = Vec::new();
         let mut expected_total = None;
+        let mut prefetched = std::collections::BTreeMap::new();
         for number in 1..=10 {
-            let (page, _): (SearchPage<T>, _) = self.get(
-                endpoint,
-                &[
-                    ("q", query.into()),
-                    ("per_page", "100".into()),
-                    ("page", number.to_string()),
-                ],
-            )?;
+            let (page, _): (SearchPage<T>, _) = match prefetched.remove(&number) {
+                Some(page) => page,
+                None => self.get(
+                    endpoint,
+                    &[
+                        ("q", query.into()),
+                        ("per_page", "100".into()),
+                        ("page", number.to_string()),
+                    ],
+                )?,
+            };
             if page.incomplete_results {
                 return Err(format!("Recherche GitHub incomplète pour {endpoint}").into());
             }
@@ -143,11 +221,30 @@ impl Api {
             if empty || items.len() > page.total_count {
                 return Err("Pagination de recherche GitHub incohérente".into());
             }
+            if endpoint == "search/commits" && number == 1 && items.len() == 100 {
+                prefetched.extend(super::parallel::collect(
+                    (2..=page.total_count.div_ceil(100)).collect(),
+                    |number| {
+                        let page: (SearchPage<T>, bool) = self.get(
+                            endpoint,
+                            &[
+                                ("q", query.into()),
+                                ("per_page", "100".into()),
+                                ("page", number.to_string()),
+                            ],
+                        )?;
+                        Ok((number, page))
+                    },
+                )?);
+            }
         }
         Err("Pagination de recherche GitHub incomplète".into())
     }
 
-    pub fn list<T: DeserializeOwned>(&self, endpoint: &str) -> Result<Vec<T>, Box<dyn Error>> {
+    pub fn list<T: DeserializeOwned + Serialize>(
+        &self,
+        endpoint: &str,
+    ) -> Result<Vec<T>, Box<dyn Error>> {
         let mut items = Vec::new();
         let mut number = 1;
         loop {
@@ -167,23 +264,32 @@ impl Api {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct SearchPage<T> {
     total_count: usize,
     incomplete_results: bool,
     items: Vec<T>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct User {
     pub login: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Issue {
     pub number: u64,
     pub repository_url: String,
-    pub pull_request: Option<serde_json::Value>,
+    pub pull_request: Option<PullRequestReference>,
+    pub user: Option<User>,
+    pub created_at: DateTime<Utc>,
+    pub comments: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(super) struct PullRequestReference {
+    pub merged_at: Option<DateTime<Utc>>,
 }
 
 impl Issue {
@@ -223,7 +329,7 @@ pub(super) fn validate_repository(value: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct PullRequestDetail {
     pub number: u64,
     pub user: Option<User>,
@@ -236,8 +342,9 @@ pub(super) struct PullRequestDetail {
     pub changed_files: usize,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct ReviewDetail {
+    #[serde(deserialize_with = "super::graphql::identifier")]
     pub id: u64,
     pub user: Option<User>,
     pub submitted_at: Option<DateTime<Utc>>,
@@ -245,26 +352,27 @@ pub(super) struct ReviewDetail {
     pub html_url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct CommentDetail {
+    #[serde(deserialize_with = "super::graphql::identifier")]
     pub id: u64,
     pub user: Option<User>,
     pub created_at: DateTime<Utc>,
     pub html_url: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Repository {
     pub full_name: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct CommitReference {
     pub sha: String,
     pub repository: Repository,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct CommitDetail {
     pub sha: String,
     pub html_url: String,
@@ -273,27 +381,41 @@ pub(super) struct CommitDetail {
     pub files: Vec<FileDetail>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct CommitMetadata {
     pub message: String,
     pub author: CommitAuthor,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct CommitAuthor {
     pub date: DateTime<Utc>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Statistics {
     pub additions: u64,
     pub deletions: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct FileDetail {
     pub filename: String,
     pub previous_filename: Option<String>,
     pub additions: Option<u64>,
     pub deletions: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct GraphResponse<T> {
+    data: Option<T>,
+    errors: Option<Vec<serde_json::Value>>,
+}
+
+fn request_error(error: Box<dyn Error>) -> String {
+    match error.downcast_ref::<reqwest::Error>() {
+        Some(error) if error.is_timeout() => "timeout".into(),
+        Some(_) => "échec réseau".into(),
+        None => error.to_string(),
+    }
 }

@@ -25,6 +25,7 @@ pub enum Event {
         number: usize,
     },
     Request {
+        method: &'static str,
         source: Source,
         operation: &'static str,
     },
@@ -37,6 +38,20 @@ pub enum Event {
     Waiting {
         source: Source,
         seconds: u64,
+    },
+    Candidates {
+        source: Source,
+        kind: &'static str,
+        count: usize,
+    },
+    Waited {
+        source: Source,
+        elapsed: Duration,
+    },
+    Statistics {
+        source: Source,
+        calls: std::collections::BTreeMap<&'static str, usize>,
+        waited: Duration,
     },
     Calculating,
     Finished {
@@ -72,8 +87,12 @@ impl Progress {
                 operation,
                 number,
             } => format!("{} : {operation}, page {number}", source.label()),
-            Event::Request { source, operation } if self.verbose => {
-                format!("{} : GET {operation}", source.label())
+            Event::Request {
+                source,
+                operation,
+                method,
+            } if self.verbose => {
+                format!("{} : {method} {operation}", source.label())
             }
             Event::RateLimit {
                 source,
@@ -102,6 +121,30 @@ impl Progress {
             Event::Waiting { source, seconds } => {
                 format!("{} : rate limit, reprise dans {seconds} s", source.label())
             }
+            Event::Candidates {
+                source,
+                kind,
+                count,
+            } if self.verbose => {
+                format!("{} : {kind} : {count} candidats", source.label())
+            }
+            Event::Statistics {
+                source,
+                calls,
+                waited,
+            } if self.verbose => {
+                let calls = calls
+                    .iter()
+                    .map(|(endpoint, count)| format!("{endpoint}={count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "{} : appels [{calls}], attente rate limit={:.2} s",
+                    source.label(),
+                    waited.as_secs_f64()
+                )
+            }
+            Event::Candidates { .. } | Event::Waited { .. } | Event::Statistics { .. } => return,
             Event::Calculating => "Calcul des métriques".into(),
             Event::Finished { elapsed, success } => format!(
                 "{} {:.2} s",
@@ -154,6 +197,7 @@ mod tests {
             number: 2,
         });
         progress.emit(Event::Request {
+            method: "GET",
             source: Source::GitHub,
             operation: "recherche",
         });

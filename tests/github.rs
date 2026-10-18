@@ -1,6 +1,68 @@
 use dev_metrics::github::{CommentKind, GitHubSource, Period, Source};
-use mockito::{Matcher, Server};
+use mockito::{Matcher, ServerGuard};
 use serde_json::{Value, json};
+
+struct Server {
+    server: ServerGuard,
+    pulls: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u64, Value>>>,
+}
+
+impl Server {
+    fn new() -> Self {
+        let mut server = mockito::Server::new();
+        let pulls = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+            u64,
+            Value,
+        >::new()));
+        let responses = pulls.clone();
+        server
+            .mock("POST", "/graphql")
+            .with_body_from_request(move |request| {
+                let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                let query = body["query"].as_str().unwrap();
+                let mut data = serde_json::Map::new();
+                for (index, part) in query.split(":repository(").skip(1).enumerate() {
+                    let number: u64 = part
+                        .split("pullRequest(number:")
+                        .nth(1)
+                        .unwrap()
+                        .split(')')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let value = if body["operationName"] == "PullRequestFiles" {
+                        json!({"files":{"nodes":[],"pageInfo":{"hasNextPage":true}}})
+                    } else {
+                        responses
+                            .lock()
+                            .unwrap()
+                            .get(&number)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    };
+                    data.insert(format!("p{index}"), json!({"pullRequest":value}));
+                }
+                json!({"data":data}).to_string().into_bytes()
+            })
+            .expect_at_least(0)
+            .create();
+        Self { server, pulls }
+    }
+}
+
+impl std::ops::Deref for Server {
+    type Target = mockito::Server;
+    fn deref(&self) -> &Self::Target {
+        &self.server
+    }
+}
+
+impl std::ops::DerefMut for Server {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.server
+    }
+}
 
 fn source(server: &Server) -> GitHubSource {
     GitHubSource::new(server.url().parse().unwrap(), "test-token").unwrap()
@@ -61,7 +123,7 @@ fn progress_tracks_repositories_and_pages_without_changing_json_or_exposing_secr
     empty_searches(&mut server);
     let mut second = issue(8, false);
     second["repository_url"] = json!("https://api.github.com/repos/team/second");
-    let query = "is:issue commenter:octocat updated:>=2026-10-01";
+    let query = "is:issue commenter:octocat updated:>=2026-10-01 created:<=2026-10-07";
     search_page(
         &mut server,
         "/search/issues",
@@ -121,8 +183,7 @@ fn period() -> Period {
 }
 
 fn issue(number: u64, is_pr: bool) -> Value {
-    let mut item =
-        json!({"number": number, "repository_url": "https://api.github.com/repos/octocat/project"});
+    let mut item = json!({"number": number, "repository_url": "https://api.github.com/repos/octocat/project", "user":{"login": if number == 9 { "alice" } else { "octocat" }}, "created_at":"2026-10-01T00:00:00Z", "comments":1,"updated_at":"2026-10-08T00:00:00Z"});
     if is_pr {
         item["pull_request"] = json!({});
     }
@@ -130,6 +191,16 @@ fn issue(number: u64, is_pr: bool) -> Value {
 }
 
 fn endpoint(server: &mut Server, path: &str, body: Value) -> mockito::Mock {
+    if path.contains("/pulls/") && body.get("changed_files").is_some() {
+        let mut pull = body.clone();
+        pull["discussion"] = json!({"nodes":[],"pageInfo":{"hasNextPage":true}});
+        pull["reviews"] = json!({"nodes":[],"pageInfo":{"hasNextPage":true}});
+        server
+            .pulls
+            .lock()
+            .unwrap()
+            .insert(body["number"].as_u64().unwrap(), pull);
+    }
     server
         .mock("GET", path)
         .match_header("authorization", "Bearer test-token")
@@ -249,25 +320,25 @@ fn collects_file_statistics_reviews_and_comments_with_repository_and_source() {
     search(
         &mut server,
         "/search/issues",
-        "is:pr author:octocat updated:>=2026-10-01",
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(7, true), issue(8, true)],
     );
     search(
         &mut server,
         "/search/issues",
-        "is:pr reviewed-by:octocat updated:>=2026-10-01",
+        "is:pr reviewed-by:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(9, true), issue(8, true)],
     );
     search(
         &mut server,
         "/search/issues",
-        "is:pr commenter:octocat updated:>=2026-10-01",
+        "is:pr commenter:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(9, true)],
     );
     search(
         &mut server,
         "/search/issues",
-        "is:issue commenter:octocat updated:>=2026-10-01",
+        "is:issue commenter:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(10, false)],
     );
     search(
@@ -411,10 +482,10 @@ fn collects_file_statistics_reviews_and_comments_with_repository_and_source() {
 
 fn empty_searches(server: &mut Server) {
     for query in [
-        "is:pr author:octocat updated:>=2026-10-01",
-        "is:pr reviewed-by:octocat updated:>=2026-10-01",
-        "is:pr commenter:octocat updated:>=2026-10-01",
-        "is:issue commenter:octocat updated:>=2026-10-01",
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
+        "is:pr reviewed-by:octocat updated:>=2026-10-01 created:<=2026-10-07",
+        "is:pr commenter:octocat updated:>=2026-10-01 created:<=2026-10-07",
+        "is:issue commenter:octocat updated:>=2026-10-01 created:<=2026-10-07",
     ] {
         search(server, "/search/issues", query, vec![]);
     }
@@ -430,7 +501,7 @@ fn empty_searches(server: &mut Server) {
 fn paginates_searches_and_deduplicates_candidates() {
     let mut server = Server::new();
     empty_searches(&mut server);
-    let query = "is:pr author:octocat updated:>=2026-10-01";
+    let query = "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07";
     search_page(
         &mut server,
         "/search/issues",
@@ -475,7 +546,7 @@ fn paginates_files_reviews_comments_and_commit_files_without_following_foreign_l
     search(
         &mut server,
         "/search/issues",
-        "is:pr author:octocat updated:>=2026-10-01",
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(7, true)],
     );
     let files = vec![file("src/a.rs", 5, 1), file("generated/client.rs", 15, 3)];
@@ -606,7 +677,7 @@ fn warns_about_missing_or_truncated_file_statistics() {
         search(
             &mut server,
             "/search/issues",
-            "is:pr author:octocat updated:>=2026-10-01",
+            "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
             vec![issue(7, true)],
         );
         let files = vec![file("src/main.rs", 1, 0)];
@@ -669,8 +740,12 @@ fn rejects_unsafe_user_repository_and_commit_paths_before_requests() {
         search(
             &mut server,
             "/search/issues",
-            "is:pr author:octocat updated:>=2026-10-01",
-            vec![json!({"number":7,"repository_url":repo,"pull_request":{}})],
+            "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
+            vec![{
+                let mut item = issue(7, true);
+                item["repository_url"] = json!(repo);
+                item
+            }],
         );
         let error = source(&server)
             .activity("octocat", period())
@@ -809,7 +884,7 @@ fn nonempty_table_matches_snapshot_and_serialized_activity_matches_schema() {
     search(
         &mut server,
         "/search/issues",
-        "is:pr author:octocat updated:>=2026-10-01",
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(7, true)],
     );
     let files = vec![file("src/main.rs", 10, 2)];
@@ -851,8 +926,12 @@ fn excludes_self_reviews_and_activity_outside_the_period() {
     search(
         &mut server,
         "/search/issues",
-        "is:pr author:octocat updated:>=2026-10-01",
-        vec![issue(7, true)],
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
+        vec![{
+            let mut item = issue(7, true);
+            item["created_at"] = json!("2026-09-01T00:00:00Z");
+            item
+        }],
     );
     mock_pr(
         &mut server,
@@ -889,7 +968,7 @@ fn rejects_malformed_review_timestamps_and_unknown_review_states() {
         search(
             &mut server,
             "/search/issues",
-            "is:pr author:octocat updated:>=2026-10-01",
+            "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
             vec![issue(7, true)],
         );
         mock_pr(
@@ -933,7 +1012,7 @@ fn supports_credentials_that_require_separate_issue_and_pull_request_searches() 
         .mock("GET", "/search/issues")
         .match_query(Matcher::UrlEncoded(
             "q".into(),
-            "commenter:octocat updated:>=2026-10-01".into(),
+            "commenter:octocat updated:>=2026-10-01 created:<=2026-10-07".into(),
         ))
         .with_status(422)
         .with_body("Mixed search is not supported for GitHub App user tokens")
@@ -941,13 +1020,13 @@ fn supports_credentials_that_require_separate_issue_and_pull_request_searches() 
     search(
         &mut server,
         "/search/issues",
-        "is:pr commenter:octocat updated:>=2026-10-01",
+        "is:pr commenter:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![],
     );
     search(
         &mut server,
         "/search/issues",
-        "is:issue commenter:octocat updated:>=2026-10-01",
+        "is:issue commenter:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![],
     );
     assert!(source(&server).activity("octocat", period()).is_ok());
@@ -978,7 +1057,7 @@ fn refuses_duplicate_results_within_a_search_instead_of_silently_losing_activity
 
 #[test]
 fn refuses_changed_search_totals_overfull_pages_and_exhausted_pagination() {
-    let query = "is:pr author:octocat updated:>=2026-10-01";
+    let query = "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07";
     let mut server = Server::new();
     empty_searches(&mut server);
     search_page(
@@ -1049,7 +1128,7 @@ fn refuses_empty_list_pages_with_a_next_link() {
     search(
         &mut server,
         "/search/issues",
-        "is:issue commenter:octocat updated:>=2026-10-01",
+        "is:issue commenter:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(7, false)],
     );
     server
@@ -1201,7 +1280,7 @@ fn refuses_duplicate_pull_requests_within_one_search() {
     search(
         &mut server,
         "/search/issues",
-        "is:pr author:octocat updated:>=2026-10-01",
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(7, true), issue(7, true)],
     );
     assert!(
@@ -1220,10 +1299,10 @@ fn common_source_collects_metrics_with_explicit_or_authenticated_identity() {
         let mut server = Server::new();
         endpoint(&mut server, "/user", json!({"login":"octocat"}));
         for query in [
-            "is:pr author:octocat updated:>=2026-09-01",
-            "is:pr reviewed-by:octocat updated:>=2026-09-01",
-            "is:pr commenter:octocat updated:>=2026-09-01",
-            "is:issue commenter:octocat updated:>=2026-09-01",
+            "is:pr author:octocat updated:>=2026-09-01 created:<=2026-10-30",
+            "is:pr reviewed-by:octocat updated:>=2026-09-01 created:<=2026-10-30",
+            "is:pr commenter:octocat updated:>=2026-09-01 created:<=2026-10-30",
+            "is:issue commenter:octocat updated:>=2026-09-01 created:<=2026-10-30",
         ] {
             let candidates = if query.contains("author:") {
                 vec![issue(7, true)]
@@ -1303,7 +1382,7 @@ fn collect_partial_pr(name: &str) -> dev_metrics::activity::Activity {
     search(
         &mut server,
         "/search/issues",
-        "is:pr author:octocat updated:>=2026-10-01",
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(7, true)],
     );
     let fixture = partial_diff(name);
@@ -1482,7 +1561,7 @@ fn empty_pr_file_page_with_next_link_warns_without_hanging() {
     search(
         &mut server,
         "/search/issues",
-        "is:pr author:octocat updated:>=2026-10-01",
+        "is:pr author:octocat updated:>=2026-10-01 created:<=2026-10-07",
         vec![issue(7, true)],
     );
     let files = vec![file("src/main.rs", 5, 1)];
@@ -1600,4 +1679,48 @@ fn connection_failure_still_fails_collection() {
             .to_string()
             .contains("échec réseau")
     );
+}
+
+#[test]
+fn verbose_measures_endpoint_attempts_candidates_and_rate_limit_waits() {
+    let mut server = Server::new();
+    let limited = server
+        .mock("GET", "/search/issues")
+        .match_query(Matcher::Any)
+        .with_status(429)
+        .with_header("retry-after", "0")
+        .expect(1)
+        .create();
+    let issues = server
+        .mock("GET", "/search/issues")
+        .match_query(Matcher::Any)
+        .with_body(json!({"total_count":0,"incomplete_results":false,"items":[]}).to_string())
+        .expect(4)
+        .create();
+    let commits = server
+        .mock("GET", "/search/commits")
+        .match_query(Matcher::Any)
+        .with_body(json!({"total_count":0,"incomplete_results":false,"items":[]}).to_string())
+        .expect(1)
+        .create();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = dev_metrics::progress::Progress::new(log.reopen().unwrap(), true, false, true);
+    source(&server)
+        .with_progress(progress)
+        .activity("octocat", period())
+        .unwrap();
+    limited.assert();
+    issues.assert();
+    commits.assert();
+    let output = std::fs::read_to_string(log.path()).unwrap();
+    for expected in [
+        "/search/issues=5",
+        "/search/commits=1",
+        "PRs et issues : 0 candidats",
+        "commits : 0 candidats",
+        "attente rate limit=0.00 s",
+    ] {
+        assert!(output.contains(expected), "missing {expected}: {output}");
+    }
+    assert!(!output.contains("test-token"));
 }

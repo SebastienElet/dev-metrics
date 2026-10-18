@@ -12,6 +12,12 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        help = "Ignorer le cache disque GitHub en lecture et écriture"
+    )]
+    pub no_cache: bool,
+    #[arg(
+        long,
+        global = true,
         help = "Désactiver la progression et les logs, même avec --verbose"
     )]
     pub quiet: bool,

@@ -77,3 +77,13 @@ fn rejects_missing_or_unknown_subcommand_and_config_without_path() {
         assert!(Cli::try_parse_from(arguments).is_err());
     }
 }
+
+#[test]
+fn accepts_no_cache_before_or_after_report() {
+    for args in [
+        ["dev-metrics", "--no-cache", "report"],
+        ["dev-metrics", "report", "--no-cache"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+}
