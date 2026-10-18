@@ -1,0 +1,15 @@
+{
+  "name": "@sebastienelet/dev-metrics",
+  "version": "0.1.0",
+  "description": "CLI pour suivre ses métriques de développement",
+  "repository": "https://github.com/SebastienElet/dev-metrics",
+  "bin": { "dev-metrics": "bin/dev-metrics.js" },
+  "files": ["bin/dev-metrics.js", "platforms.json"],
+  "optionalDependencies": {
+    "@sebastienelet/dev-metrics-darwin-arm64": "=0.1.0",
+    "@sebastienelet/dev-metrics-darwin-x64": "=0.1.0",
+    "@sebastienelet/dev-metrics-linux-x64": "=0.1.0",
+    "@sebastienelet/dev-metrics-linux-arm64": "=0.1.0",
+    "@sebastienelet/dev-metrics-win32-x64": "=0.1.0"
+  }
+}

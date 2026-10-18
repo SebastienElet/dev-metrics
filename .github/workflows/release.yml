@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            binary: dev-metrics
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: dev-metrics
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: dev-metrics
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: dev-metrics
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: dev-metrics.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Check version and build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).packages.find(p => p.name === "dev-metrics").version')
+          test "$version" = "$(node -p 'require("./npm/package.json").version')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          cargo build --release --locked --target "$TARGET"
+          mkdir dist
+          tar -C "target/$TARGET/release" -czf "dist/dev-metrics-v${version}-${TARGET}.tar.gz" "$BINARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binary-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  package-check:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+      - name: Check release packages
+        run: |
+          version=$(node -p 'require("./npm/package.json").version')
+          (cd dist && for archive in ./*.tar.gz; do archive=${archive#./}; sha256sum "$archive" > "$archive.sha256"; done)
+          node npm/prepare-release.mjs dist "$version"
+          dist/npm/linux-x64/bin/dev-metrics --version
+          npm pack --dry-run ./npm
+          for package in dist/npm/*; do npm pack --dry-run "$package"; done
+
+  preflight:
+    if: github.ref_type == 'tag'
+    needs: package-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Check npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          : "${NODE_AUTH_TOKEN:?Configure NPM_TOKEN before releasing}"
+          npm whoami
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: preflight
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: binary-*
+          merge-multiple: true
+          path: dist
+      - name: Generate SHA-256 checksums
+        run: (cd dist && for archive in ./*.tar.gz; do archive=${archive#./}; sha256sum "$archive" > "$archive.sha256"; done)
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/publish-github-release.sh dist "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY"
+      - name: Record verified asset digests
+        run: sha256sum dist/* > release-assets.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-asset-digests
+          path: release-assets.sha256
+          if-no-files-found: error
+
+  npm:
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24.22.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir dist
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz*' --dir dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-asset-digests
+      - name: Prepare and publish npm packages with provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          sha256sum --check release-assets.sha256
+          version="${GITHUB_REF_NAME#v}"
+          node npm/prepare-release.mjs dist "$version"
+          node npm/publish-release.mjs dist/npm/* ./npm
