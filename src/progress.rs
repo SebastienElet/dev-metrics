@@ -82,6 +82,16 @@ pub enum Event {
         cache_hits: usize,
         cache_misses: usize,
     },
+    Warning {
+        warning: crate::activity::ActivityWarning,
+    },
+    Retrying {
+        source: Source,
+        operation: &'static str,
+        status: u16,
+        attempt: u32,
+        seconds: u64,
+    },
     Calculating,
     Warnings {
         count: usize,
@@ -266,7 +276,7 @@ impl Display {
             self.render();
             let _ = self.writer.flush();
         }
-        let waiting = matches!(event, Event::Waiting { .. });
+        let waiting = matches!(event, Event::Waiting { .. } | Event::Retrying { .. });
         let detail = matches!(
             event,
             Event::Page { .. }
@@ -274,6 +284,7 @@ impl Display {
                 | Event::RateLimit { .. }
                 | Event::EndpointSummary { .. }
                 | Event::CollectionSummary { .. }
+                | Event::Warning { .. }
         );
         if detail && !self.verbose {
             return;
@@ -340,6 +351,17 @@ impl Display {
                 "{} : collecte en {:.3} s ; cache : {cache_hits} hits, {cache_misses} miss",
                 source.label(),
                 elapsed.as_secs_f64()
+            ),
+            Event::Warning { warning } => serde_json::to_string(&warning).unwrap_or_default(),
+            Event::Retrying {
+                source,
+                operation,
+                status,
+                attempt,
+                seconds,
+            } => format!(
+                "{} : {operation}, HTTP {status}, tentative {attempt}/3 dans {seconds} s",
+                source.label()
             ),
             Event::Calculating => "Calcul des métriques".into(),
             Event::Finished { .. } | Event::Warnings { .. } => unreachable!(),

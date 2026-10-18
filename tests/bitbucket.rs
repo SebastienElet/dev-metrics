@@ -545,7 +545,7 @@ fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
     assert!(
         std::fs::read_to_string(log.path())
             .unwrap()
-            .contains("Bitbucket · rate limit, reprise dans 0 s")
+            .contains("Bitbucket · rate limit, reprise dans")
     );
 }
 
@@ -747,7 +747,7 @@ fn basic_auth_survives_rate_limit_retry_and_redirect_with_progress() {
     identity.assert();
     repositories.assert();
     let output = std::fs::read_to_string(log.path()).unwrap();
-    assert!(output.contains("Bitbucket · rate limit, reprise dans 0 s"));
+    assert!(output.contains("Bitbucket · rate limit, reprise dans"));
     for secret in ["fake-bitbucket-token", "alice@example.test", authorization] {
         assert!(!output.contains(secret));
     }

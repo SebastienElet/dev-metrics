@@ -259,7 +259,9 @@ fn collect_output(
             progress.emit(Event::Warnings {
                 count: report.warnings.len(),
             });
-            if !matches!(format, ReportFormat::Json) {
+            if matches!(format, ReportFormat::Json) {
+                verbose_warnings(progress, &report.warnings);
+            } else {
                 write_warnings(warnings_writer, &report.warnings)?;
             }
             return match format {
@@ -287,12 +289,23 @@ fn collect_output(
         count: activity.warnings.len(),
     });
     match format {
-        ActivityFormat::Json => serde_json::to_string(&activity)
-            .map_err(|error| CommandError::new(ErrorCode::OutputError, error)),
+        ActivityFormat::Json => {
+            verbose_warnings(progress, &activity.warnings);
+            serde_json::to_string(&activity)
+                .map_err(|error| CommandError::new(ErrorCode::OutputError, error))
+        }
         ActivityFormat::Table => {
             write_warnings(warnings_writer, &activity.warnings)?;
             Ok(activity.table())
         }
+    }
+}
+
+fn verbose_warnings(progress: &Progress, warnings: &[dev_metrics::activity::ActivityWarning]) {
+    for warning in warnings {
+        progress.emit(Event::Warning {
+            warning: warning.clone(),
+        });
     }
 }
 

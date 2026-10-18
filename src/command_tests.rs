@@ -479,6 +479,94 @@ fn custom_period_defaults_to_today_and_schema_command_validates_its_output() {
 
 struct WarningSource;
 
+#[test]
+fn bitbucket_http_warning_is_printed_once_and_counted_for_each_report_format() {
+    for format in ["table", "markdown", "json"] {
+        let mut server = mockito::Server::new();
+        for (path, body) in [
+            ("/2.0/user", json!({"uuid":"{alice}"})),
+            (
+                "/2.0/repositories/team",
+                json!({"values":[{"full_name":"team/project"}]}),
+            ),
+            (
+                "/2.0/repositories/team/project/commits",
+                json!({"values":[]}),
+            ),
+            (
+                "/2.0/repositories/team/project/pullrequests",
+                json!({"values":[{
+                    "id":1,"author":{"uuid":"{alice}"},"title":"Change","state":"OPEN",
+                    "created_on":"2026-10-02T00:00:00Z","updated_on":"2026-10-02T00:00:00Z",
+                    "links":{"html":{"href":"https://bitbucket.org/team/project/pull-requests/1"}}
+                }]}),
+            ),
+        ] {
+            server
+                .mock("GET", path)
+                .match_query(mockito::Matcher::Any)
+                .with_body(body.to_string())
+                .create();
+        }
+        let denied = server
+            .mock(
+                "GET",
+                "/2.0/repositories/team/project/pullrequests/1/activity",
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .expect(1)
+            .create();
+        let (_directory, cli) = cli(
+            &[
+                "report",
+                "--source",
+                "bitbucket",
+                "--workspace",
+                "team",
+                "--since",
+                "2026-10-01",
+                "--format",
+                format,
+                "--verbose",
+            ],
+            "",
+        );
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let progress = Progress::new(log.as_file().try_clone().unwrap(), true, false, true);
+        run_with_warnings(
+            &progress,
+            cli,
+            today(),
+            |_, _, _| {
+                Ok(Box::new(
+                    dev_metrics::bitbucket::BitbucketSource::new(
+                        format!("{}/2.0/", server.url()).parse().unwrap(),
+                        "test-token",
+                        "team",
+                    )
+                    .unwrap()
+                    .with_progress(progress.clone()),
+                ))
+            },
+            &mut log.as_file().try_clone().unwrap(),
+        )
+        .unwrap();
+        progress.emit(Event::Finished {
+            elapsed: std::time::Duration::ZERO,
+            success: true,
+        });
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(
+            output.matches("\"code\":\"ITEM_UNAVAILABLE\"").count(),
+            1,
+            "{output}"
+        );
+        assert!(output.ends_with("1 avertissement\n"), "{output}");
+        denied.assert();
+    }
+}
+
 impl ActivitySource for WarningSource {
     fn collect_activity(
         &self,
@@ -652,6 +740,7 @@ fn partial_statistics_warnings_survive_quiet_and_non_tty_progress() {
             arguments.extend(options);
             let (_directory, cli) = cli(&arguments, "");
             let quiet = cli.quiet;
+            let verbose = cli.verbose;
             let log = tempfile::NamedTempFile::new().unwrap();
             let progress = Progress::new(
                 log.as_file().try_clone().unwrap(),
@@ -688,7 +777,11 @@ fn partial_statistics_warnings_survive_quiet_and_non_tty_progress() {
                 .filter_map(|line| line.find('{').map(|start| &line[start..]))
                 .collect::<Vec<_>>();
             let warning = if format == "json" {
-                assert!(warning_lines.is_empty());
+                assert_eq!(
+                    warning_lines.len(),
+                    usize::from(terminal && verbose && !quiet),
+                    "{stderr}"
+                );
                 serde_json::from_str::<Value>(&stdout).unwrap()["warnings"][0].clone()
             } else {
                 assert_eq!(warning_lines.len(), 1, "{stderr}");

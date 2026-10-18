@@ -1,3 +1,5 @@
+pub(crate) mod retry;
+
 use crate::activity::Source;
 use crate::progress::{Event, Progress};
 use reqwest::blocking::{RequestBuilder, Response};

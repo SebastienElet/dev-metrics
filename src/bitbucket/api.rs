@@ -88,6 +88,10 @@ impl Api {
         });
     }
 
+    pub fn rate_limit_error(&self) -> Option<crate::http::retry::RateLimitError> {
+        self.rate_limit.lock().unwrap().current_error()
+    }
+
     pub fn start_collection(&self) {
         self.statistics.lock().unwrap().clear();
         self.rate_limit.lock().unwrap().start_collection();
@@ -136,10 +140,10 @@ impl Api {
                 continue;
             }
             if !response.status().is_success() {
-                return Err(format!(
-                    "Bitbucket : HTTP {} (vérifiez le token, les permissions et les limites API)",
-                    response.status().as_u16()
-                )
+                return Err(RequestFailure {
+                    status: response.status().as_u16(),
+                    operation: endpoint.label(),
+                }
                 .into());
             }
             let started = Instant::now();
@@ -215,17 +219,77 @@ impl Api {
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse().ok()),
             });
-            if response.status() != 429 {
+            let status = response.status().as_u16();
+            if (500..600).contains(&status) && attempt < 2 {
+                let delay = crate::http::retry::delay(
+                    response.headers(),
+                    attempt,
+                    std::time::SystemTime::now(),
+                    crate::http::retry::jitter(),
+                );
+                let Ok(delay) = delay else {
+                    return Err(RequestFailure {
+                        status,
+                        operation: endpoint.label(),
+                    }
+                    .into());
+                };
+                if delay > Duration::from_secs(300) {
+                    return Err(RequestFailure {
+                        status,
+                        operation: endpoint.label(),
+                    }
+                    .into());
+                }
+                drop(response);
+                crate::http::retry::wait(
+                    delay,
+                    |seconds| {
+                        self.progress.emit(Event::Retrying {
+                            source: Source::Bitbucket,
+                            operation: endpoint.label(),
+                            status,
+                            attempt: attempt + 2,
+                            seconds,
+                        })
+                    },
+                    std::thread::sleep,
+                );
+                continue;
+            }
+            if !matches!(status, 403 | 429) {
                 return Ok(response);
             }
-            let delay = self
-                .rate_limit
-                .lock()
-                .unwrap()
-                .defer(response.headers(), attempt)?;
+            let headers = response.headers().clone();
+            let limited_by_headers = crate::http::retry::is_rate_limited(status, &headers, &[]);
+            let body = if status == 403 && !limited_by_headers {
+                let started = Instant::now();
+                let body = response.bytes();
+                self.statistics
+                    .lock()
+                    .unwrap()
+                    .entry(endpoint)
+                    .or_default()
+                    .elapsed += started.elapsed();
+                body.map_err(|_| RequestFailure {
+                    status,
+                    operation: endpoint.label(),
+                })?
+                .to_vec()
+            } else {
+                Vec::new()
+            };
+            if !crate::http::retry::is_rate_limited(status, &headers, &body) {
+                return Err(RequestFailure {
+                    status,
+                    operation: endpoint.label(),
+                }
+                .into());
+            }
+            let delay = self.rate_limit.lock().unwrap().defer(&headers, attempt)?;
             self.progress.emit(Event::Waiting {
                 source: Source::Bitbucket,
-                seconds: delay.as_secs(),
+                seconds: delay.as_secs() + u64::from(delay.subsec_nanos() > 0),
             });
         }
         Err("Bitbucket : HTTP 429 après trois tentatives".into())
@@ -390,3 +454,21 @@ struct Page<T> {
     next: Option<String>,
     size: Option<usize>,
 }
+
+#[derive(Debug)]
+pub(super) struct RequestFailure {
+    pub status: u16,
+    pub operation: &'static str,
+}
+
+impl std::fmt::Display for RequestFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Bitbucket : {} HTTP {}",
+            self.operation, self.status
+        )
+    }
+}
+
+impl Error for RequestFailure {}

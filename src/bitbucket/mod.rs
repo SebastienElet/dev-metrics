@@ -5,8 +5,8 @@ mod rate_limit;
 pub use auth::{resolve_token, resolve_workspace};
 
 use crate::activity::{
-    Activity, ActivitySource, Comment, CommentKind, Commit, FileChange, Period, PullRequest,
-    Review, ReviewState, Source,
+    Activity, ActivitySource, ActivityWarning, Comment, CommentKind, Commit, FileChange, Period,
+    PullRequest, Review, ReviewState, Source, WarningCode, WarningSubject,
 };
 use crate::progress::{Event as ProgressEvent, Progress};
 use chrono::{DateTime, Utc};
@@ -63,7 +63,11 @@ impl BitbucketSource {
     pub fn activity(&self, user: Option<&str>, period: Period) -> Result<Activity, Box<dyn Error>> {
         let started = std::time::Instant::now();
         self.api.start_collection();
-        let result = self.collect(user, period);
+        let result = self.collect(user, period).map_err(|error| {
+            self.api
+                .rate_limit_error()
+                .map_or(error, |rate_limit| rate_limit.into())
+        });
         self.api.summarize(started.elapsed());
         result
     }
@@ -113,6 +117,7 @@ impl BitbucketSource {
             discovered.into_iter().enumerate().collect(),
             |(index, repository)| {
                 let mut candidates = Vec::new();
+                let mut warnings = Vec::new();
                 let endpoint = format!("repositories/{}", repository.full_name);
                 self.api.progress.emit(ProgressEvent::Repositories {
                     source: Source::Bitbucket,
@@ -121,7 +126,9 @@ impl BitbucketSource {
                     total,
                 });
                 let mut pull_requests = BTreeSet::new();
-                for detail in self.api.list::<PullRequestDetail>(
+                for detail in self.list_candidates::<PullRequestDetail>(
+                    &repository.full_name,
+                    &mut warnings,
                     &format!("{endpoint}/pullrequests"),
                     &[
                         ("state", "OPEN"),
@@ -149,10 +156,12 @@ impl BitbucketSource {
                     current: index + 1,
                     total,
                 });
-                for commit in self
-                    .api
-                    .list::<CommitDetail>(&format!("{endpoint}/commits"), &[])?
-                {
+                for commit in self.list_candidates::<CommitDetail>(
+                    &repository.full_name,
+                    &mut warnings,
+                    &format!("{endpoint}/commits"),
+                    &[],
+                )? {
                     if commit.hash.is_empty() || !commit.hash.bytes().all(|c| c.is_ascii_hexdigit())
                     {
                         return Err("Hash Bitbucket invalide".into());
@@ -168,32 +177,65 @@ impl BitbucketSource {
                     }
                     candidates.push(Candidate::Commit(repository.full_name.clone(), commit));
                 }
-                Ok(candidates)
+                Ok((candidates, warnings))
             },
         )?;
-        let collected = parallel(groups.into_iter().flatten().collect(), |candidate| {
+        let mut candidates = Vec::new();
+        for (mut discovered, mut warnings) in groups {
+            candidates.append(&mut discovered);
+            activity.warnings.append(&mut warnings);
+        }
+        let collected = parallel(candidates, |candidate| {
             let mut part = Activity::empty(Source::Bitbucket, &identity.uuid, period.clone());
-            match candidate {
-                Candidate::PullRequest(repository, detail) => {
-                    self.pull_request(&mut part, &repository, detail)?;
+            let (repository, subject) = match &candidate {
+                Candidate::PullRequest(repository, detail) => (
+                    repository.clone(),
+                    WarningSubject::PullRequest { number: detail.id },
+                ),
+                Candidate::Commit(repository, commit) => (
+                    repository.clone(),
+                    WarningSubject::Commit {
+                        sha: commit.hash.clone(),
+                    },
+                ),
+            };
+            let result: Result<(), Box<dyn Error>> = (|| {
+                match candidate {
+                    Candidate::PullRequest(repository, detail) => {
+                        self.pull_request(&mut part, &repository, detail)?;
+                    }
+                    Candidate::Commit(repository, commit) => {
+                        let (files, additions, deletions) = self.files(&format!(
+                            "repositories/{repository}/diffstat/{}",
+                            commit.hash
+                        ))?;
+                        part.commits.push(Commit {
+                            source: Source::Bitbucket,
+                            repository,
+                            sha: commit.hash,
+                            message: commit.message,
+                            url: commit.links.html.href,
+                            authored_at: commit.date,
+                            additions,
+                            deletions,
+                            files,
+                        });
+                    }
                 }
-                Candidate::Commit(repository, commit) => {
-                    let (files, additions, deletions) = self.files(&format!(
-                        "repositories/{repository}/diffstat/{}",
-                        commit.hash
-                    ))?;
-                    part.commits.push(Commit {
-                        source: Source::Bitbucket,
-                        repository,
-                        sha: commit.hash,
-                        message: commit.message,
-                        url: commit.links.html.href,
-                        authored_at: commit.date,
-                        additions,
-                        deletions,
-                        files,
-                    });
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if !error.is::<api::RequestFailure>() {
+                    return Err(error);
                 }
+                part = Activity::empty(Source::Bitbucket, &identity.uuid, period.clone());
+                part.warnings.push(ActivityWarning {
+                    source: Source::Bitbucket,
+                    repository,
+                    subject,
+                    code: WarningCode::ItemUnavailable,
+                    message: format!("Élément ignoré : {error}"),
+                });
             }
             Ok(part)
         })?;
@@ -203,8 +245,32 @@ impl BitbucketSource {
             activity.reviews_received.append(&mut part.reviews_received);
             activity.comments.append(&mut part.comments);
             activity.commits.append(&mut part.commits);
+            activity.warnings.append(&mut part.warnings);
         }
         Ok(activity)
+    }
+
+    fn list_candidates<T: serde::de::DeserializeOwned>(
+        &self,
+        repository: &str,
+        warnings: &mut Vec<ActivityWarning>,
+        endpoint: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Vec<T>, Box<dyn Error>> {
+        match self.api.list(endpoint, query) {
+            Ok(values) => Ok(values),
+            Err(error) if error.is::<api::RequestFailure>() => {
+                warnings.push(ActivityWarning {
+                    source: Source::Bitbucket,
+                    repository: repository.into(),
+                    subject: WarningSubject::Repository,
+                    code: WarningCode::CollectionUnavailable,
+                    message: format!("Collection ignorée : {error}"),
+                });
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn pull_request(
