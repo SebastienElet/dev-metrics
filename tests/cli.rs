@@ -23,6 +23,59 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
+fn progress_options_preserve_non_tty_stdout_and_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let baseline = isolated_command().arg("schema").output().unwrap();
+    for options in [
+        vec!["--quiet"],
+        vec!["--verbose"],
+        vec!["--quiet", "--verbose"],
+    ] {
+        let output = isolated_command()
+            .arg("schema")
+            .args(&options)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(output.stdout, baseline.stdout);
+        assert!(output.stderr.is_empty());
+        let error = isolated_command()
+            .args(["report", "--config", "config.example.toml"])
+            .args(&options)
+            .env("PATH", directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(error.status.code(), Some(4), "{}", stderr(&error));
+        assert!(error.stdout.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&error.stderr).unwrap();
+        assert_eq!(value["code"], "AUTHENTICATION_ERROR");
+    }
+}
+
+#[test]
+fn config_check_keeps_its_json_and_exit_status_with_progress_flags() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    for options in [vec![], vec!["--verbose"], vec!["--quiet", "--verbose"]] {
+        let output = isolated_command()
+            .arg("--config")
+            .arg(&config)
+            .args(["config", "check", "--format", "json"])
+            .args(options)
+            .env("HOME", directory.path())
+            .env("PATH", directory.path())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+        assert!(output.stderr.is_empty());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["github"]["status"], "skipped");
+        assert_eq!(value["bitbucket"]["status"], "skipped");
+    }
+}
+
+#[test]
 fn help_works_without_home_or_config() {
     for arguments in [
         vec!["--help"],
@@ -40,6 +93,8 @@ fn help_works_without_home_or_config() {
         assert!(stdout(&output).contains("Usage:"));
         assert!(stdout(&output).contains("Usage: dev-metrics"));
         assert!(stdout(&output).contains("--config"));
+        assert!(stdout(&output).contains("--quiet"));
+        assert!(stdout(&output).contains("--verbose"));
         assert!(stdout(&output).contains("Exemple"));
         assert!(stdout(&output).contains("Codes de sortie :"));
         assert!(output.stderr.is_empty());

@@ -6,6 +6,116 @@ fn source(server: &Server) -> GitHubSource {
     GitHubSource::new(server.url().parse().unwrap(), "test-token").unwrap()
 }
 
+#[test]
+fn authenticated_identity_has_progress_before_collection() {
+    let mut server = Server::new();
+    endpoint(&mut server, "/user", json!({"login":"octocat"}));
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = dev_metrics::progress::Progress::new(log.reopen().unwrap(), true, false, false);
+    assert_eq!(
+        source(&server)
+            .with_progress(progress)
+            .authenticated_user()
+            .unwrap(),
+        "octocat"
+    );
+    assert!(
+        std::fs::read_to_string(log.path())
+            .unwrap()
+            .contains("GitHub : identification")
+    );
+}
+
+#[test]
+fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
+    let mut server = Server::new();
+    let limited = server
+        .mock("GET", "/user")
+        .match_header("authorization", "Bearer test-token")
+        .with_status(403)
+        .with_header("retry-after", "0")
+        .expect(1)
+        .create();
+    let success = endpoint(&mut server, "/user", json!({"login":"octocat"}));
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = dev_metrics::progress::Progress::new(log.reopen().unwrap(), true, false, false);
+    assert_eq!(
+        source(&server)
+            .with_progress(progress)
+            .authenticated_user()
+            .unwrap(),
+        "octocat"
+    );
+    limited.assert();
+    success.assert();
+    assert!(
+        std::fs::read_to_string(log.path())
+            .unwrap()
+            .contains("GitHub : rate limit, reprise dans 0 s")
+    );
+}
+
+#[test]
+fn progress_tracks_repositories_and_pages_without_changing_json_or_exposing_secrets() {
+    let mut server = Server::new();
+    empty_searches(&mut server);
+    let mut second = issue(8, false);
+    second["repository_url"] = json!("https://api.github.com/repos/team/second");
+    let query = "is:issue commenter:octocat updated:>=2026-10-01";
+    search_page(
+        &mut server,
+        "/search/issues",
+        query,
+        1,
+        2,
+        vec![issue(7, false)],
+    );
+    search_page(&mut server, "/search/issues", query, 2, 2, vec![second]);
+    endpoint(
+        &mut server,
+        "/repos/octocat/project/issues/7/comments?per_page=100&page=1",
+        json!([]),
+    );
+    endpoint(
+        &mut server,
+        "/repos/team/second/issues/8/comments?per_page=100&page=1",
+        json!([]),
+    );
+    let baseline =
+        serde_json::to_string(&source(&server).activity("octocat", period()).unwrap()).unwrap();
+    for (terminal, quiet, verbose) in [
+        (true, false, false),
+        (true, false, true),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let progress =
+            dev_metrics::progress::Progress::new(log.reopen().unwrap(), terminal, quiet, verbose);
+        let activity = source(&server)
+            .with_progress(progress)
+            .activity("octocat", period())
+            .unwrap();
+        assert_eq!(serde_json::to_string(&activity).unwrap(), baseline);
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        if !terminal || quiet {
+            assert!(output.is_empty());
+            continue;
+        }
+        for expected in [
+            "GitHub : collecte",
+            "PRs et commentaires 1/2 dépôts",
+            "PRs et commentaires 2/2 dépôts",
+            "page 2",
+            "commits 0/0 dépôts",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert_eq!(output.contains("GET"), verbose);
+        assert!(!output.contains("test-token"));
+    }
+}
+
 fn period() -> Period {
     Period::parse("2026-10-01", "2026-10-07").unwrap()
 }

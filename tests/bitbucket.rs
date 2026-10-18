@@ -12,6 +12,103 @@ fn source(server: &Server) -> BitbucketSource {
     .unwrap()
 }
 
+#[test]
+fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
+    let mut server = Server::new();
+    let limited = server
+        .mock("GET", "/2.0/user")
+        .match_header("authorization", "Bearer test-token")
+        .with_status(429)
+        .with_header("retry-after", "0")
+        .expect(1)
+        .create();
+    let success = endpoint(&mut server, "/2.0/user", user("{alice}"));
+    endpoint(&mut server, "/2.0/repositories/team", json!({"values":[]}));
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = dev_metrics::progress::Progress::new(log.reopen().unwrap(), true, false, false);
+    assert_eq!(
+        source(&server)
+            .with_progress(progress)
+            .activity(None, period())
+            .unwrap()
+            .user,
+        "{alice}"
+    );
+    limited.assert();
+    success.assert();
+    assert!(
+        std::fs::read_to_string(log.path())
+            .unwrap()
+            .contains("Bitbucket : rate limit, reprise dans 0 s")
+    );
+}
+
+#[test]
+fn progress_tracks_repositories_and_opaque_pages_without_changing_json_or_exposing_secrets() {
+    let mut server = Server::new();
+    endpoint(&mut server, "/2.0/user", user("{alice}"));
+    server
+        .mock("GET", "/2.0/repositories/team")
+        .match_query(Matcher::UrlEncoded("pagelen".into(), "100".into()))
+        .with_body(
+            json!({"values":[{"full_name":"team/first"}],"next":"?cursor=test-token","size":2})
+                .to_string(),
+        )
+        .create();
+    server
+        .mock("GET", "/2.0/repositories/team")
+        .match_query(Matcher::UrlEncoded("cursor".into(), "test-token".into()))
+        .with_header("x-ratelimit-limit", "1000")
+        .with_header("x-ratelimit-nearlimit", "true")
+        .with_body(json!({"values":[{"full_name":"team/second"}],"size":2}).to_string())
+        .create();
+    for repository in ["first", "second"] {
+        for operation in ["pullrequests", "commits"] {
+            endpoint(
+                &mut server,
+                &format!("/2.0/repositories/team/{repository}/{operation}"),
+                json!({"values":[]}),
+            );
+        }
+    }
+    let baseline =
+        serde_json::to_string(&source(&server).activity(None, period()).unwrap()).unwrap();
+    for (terminal, quiet, verbose) in [
+        (true, false, false),
+        (true, false, true),
+        (false, false, true),
+        (true, true, true),
+    ] {
+        let log = tempfile::NamedTempFile::new().unwrap();
+        let progress =
+            dev_metrics::progress::Progress::new(log.reopen().unwrap(), terminal, quiet, verbose);
+        let activity = source(&server)
+            .with_progress(progress)
+            .activity(None, period())
+            .unwrap();
+        assert_eq!(serde_json::to_string(&activity).unwrap(), baseline);
+        let output = std::fs::read_to_string(log.path()).unwrap();
+        if !terminal || quiet {
+            assert!(output.is_empty());
+            continue;
+        }
+        for expected in [
+            "Bitbucket : collecte",
+            "PRs 1/2 dépôts",
+            "PRs 2/2 dépôts",
+            "commits 2/2 dépôts",
+            "page 2",
+        ] {
+            assert!(output.contains(expected), "missing {expected}: {output}");
+        }
+        assert_eq!(output.contains("GET"), verbose);
+        assert_eq!(output.contains("limite 1000"), verbose);
+        assert_eq!(output.contains("quota presque épuisé"), verbose);
+        assert!(!output.contains("test-token"));
+        assert!(!output.contains("cursor"));
+    }
+}
+
 fn period() -> Period {
     Period::parse("2026-10-01", "2026-10-07").unwrap()
 }
@@ -75,6 +172,59 @@ fn authenticates_with_atlassian_email_when_configured() {
     assert_eq!(source.activity(None, period()).unwrap().user, "{alice}");
     identity.assert();
     repositories.assert();
+}
+
+#[test]
+fn basic_auth_survives_rate_limit_retry_and_redirect_with_progress() {
+    let mut server = Server::new();
+    let authorization = "Basic YWxpY2VAZXhhbXBsZS50ZXN0OmZha2UtYml0YnVja2V0LXRva2Vu";
+    let limited = server
+        .mock("GET", "/2.0/user")
+        .match_header("authorization", authorization)
+        .with_status(429)
+        .with_header("retry-after", "0")
+        .expect(1)
+        .create();
+    let redirect = server
+        .mock("GET", "/2.0/user")
+        .match_header("authorization", authorization)
+        .with_status(302)
+        .with_header("location", "/2.0/identity")
+        .expect(1)
+        .create();
+    let identity = server
+        .mock("GET", "/2.0/identity")
+        .match_header("authorization", authorization)
+        .with_header("content-type", "application/json")
+        .with_body(user("{alice}").to_string())
+        .create();
+    let repositories = server
+        .mock("GET", "/2.0/repositories/team")
+        .match_query(Matcher::Any)
+        .match_header("authorization", authorization)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"values":[]}).to_string())
+        .create();
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = dev_metrics::progress::Progress::new(log.reopen().unwrap(), true, false, true);
+    let source = BitbucketSource::new_with_email(
+        format!("{}/2.0/", server.url()).parse().unwrap(),
+        "fake-bitbucket-token",
+        "alice@example.test",
+        "team",
+    )
+    .unwrap()
+    .with_progress(progress);
+    assert_eq!(source.activity(None, period()).unwrap().user, "{alice}");
+    limited.assert();
+    redirect.assert();
+    identity.assert();
+    repositories.assert();
+    let output = std::fs::read_to_string(log.path()).unwrap();
+    assert!(output.contains("Bitbucket : rate limit, reprise dans 0 s"));
+    for secret in ["fake-bitbucket-token", "alice@example.test", authorization] {
+        assert!(!output.contains(secret));
+    }
 }
 
 #[test]

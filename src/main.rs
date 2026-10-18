@@ -8,22 +8,37 @@ use cli::{ActivityFormat, Cli, Command, ReportFormat, SourceKind};
 use dev_metrics::activity::{ActivitySource, Period};
 use dev_metrics::config::{Config, config_path, validate_setting};
 use dev_metrics::metrics::REPORT_SCHEMA;
-use std::io::Write;
+use dev_metrics::progress::{Event, Progress};
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
+use std::time::Instant;
 
 fn main() -> ExitCode {
+    let started = Instant::now();
+    let mut progress = Progress::default();
     let result = match Cli::try_parse() {
-        Ok(cli) => match &cli.command {
-            Command::Config {
-                action: ConfigAction::Check { format },
-            } => run_config_check(&cli, *format),
-            _ => run(
-                cli,
-                DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive(),
-                load_source,
-            )
-            .map(|output| (output, 0)),
-        },
+        Ok(cli) => {
+            if matches!(
+                cli.command,
+                Command::Report { .. } | Command::Github { .. } | Command::Bitbucket { .. }
+            ) {
+                let stderr = std::io::stderr();
+                let terminal = stderr.is_terminal();
+                progress = Progress::new(stderr, terminal, cli.quiet, cli.verbose);
+            }
+            match &cli.command {
+                Command::Config {
+                    action: ConfigAction::Check { format },
+                } => run_config_check(&cli, *format),
+                _ => run(
+                    &progress,
+                    cli,
+                    DateTime::<Utc>::from(std::time::SystemTime::now()).date_naive(),
+                    |kind, config, workspace| load_source(kind, config, workspace, &progress),
+                )
+                .map(|output| (output, 0)),
+            }
+        }
         Err(error)
             if matches!(
                 error.kind(),
@@ -36,6 +51,10 @@ fn main() -> ExitCode {
     };
     let result = result.and_then(|(output, code)| {
         write_output(&mut std::io::stdout().lock(), &output).map(|()| code)
+    });
+    progress.emit(Event::Finished {
+        elapsed: started.elapsed(),
+        success: result.as_ref().is_ok_and(|code| *code == 0),
     });
     match result {
         Ok(code) => ExitCode::from(code),
@@ -62,6 +81,7 @@ fn write_output(writer: &mut impl Write, output: &str) -> Result<(), CommandErro
 }
 
 fn run(
+    progress: &Progress,
     cli: Cli,
     today: NaiveDate,
     source_factory: impl FnMut(
@@ -70,10 +90,17 @@ fn run(
         Option<&str>,
     ) -> Result<Box<dyn ActivitySource>, CommandError>,
 ) -> Result<String, CommandError> {
-    run_with_warnings(cli, today, source_factory, &mut std::io::stderr().lock())
+    run_with_warnings(
+        progress,
+        cli,
+        today,
+        source_factory,
+        &mut std::io::stderr().lock(),
+    )
 }
 
 fn run_with_warnings(
+    progress: &Progress,
     cli: Cli,
     today: NaiveDate,
     mut source_factory: impl FnMut(
@@ -204,9 +231,9 @@ fn run_with_warnings(
                 })
                 .collect::<Vec<_>>();
             let report = if since.is_some() {
-                dev_metrics::metrics::collect_period(&requests, period, &config.metrics)
+                dev_metrics::metrics::collect_period_with_progress(&requests, period, &config.metrics, progress)
             } else {
-                dev_metrics::metrics::collect(&requests, period.end(), &config.metrics)
+                dev_metrics::metrics::collect_with_progress(&requests, period.end(), &config.metrics, progress)
             }.map_err(|error| CommandError {
                 code: ErrorCode::ReportError,
                 message: error.to_string(),
@@ -283,6 +310,7 @@ fn load_source(
     kind: SourceKind,
     config: &Config,
     workspace: Option<&str>,
+    progress: &Progress,
 ) -> Result<Box<dyn ActivitySource>, CommandError> {
     let auth_error = |error: Box<dyn std::error::Error>| {
         CommandError::new(ErrorCode::AuthenticationError, error).source(kind.as_str())
@@ -299,7 +327,9 @@ fn load_source(
                 "https://api.github.com/".parse().unwrap(),
                 &token,
             )
-            .map(|source| Box::new(source) as Box<dyn ActivitySource>)
+            .map(|source| {
+                Box::new(source.with_progress(progress.clone())) as Box<dyn ActivitySource>
+            })
             .map_err(auth_error)
         }
         SourceKind::Bitbucket => {
@@ -325,7 +355,9 @@ fn load_source(
                 None => dev_metrics::bitbucket::BitbucketSource::new(api_base, &token, workspace),
             };
             source
-                .map(|source| Box::new(source) as Box<dyn ActivitySource>)
+                .map(|source| {
+                    Box::new(source.with_progress(progress.clone())) as Box<dyn ActivitySource>
+                })
                 .map_err(auth_error)
         }
     }
