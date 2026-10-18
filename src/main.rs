@@ -90,16 +90,33 @@ fn run(
         Option<&str>,
     ) -> Result<Box<dyn ActivitySource>, CommandError>,
 ) -> Result<String, CommandError> {
-    run_with_warnings(
-        progress,
-        cli,
-        today,
-        source_factory,
-        &mut std::io::stderr().lock(),
-    )
+    run_with_warnings(progress, cli, today, source_factory, &mut std::io::stderr())
 }
 
 fn run_with_warnings(
+    progress: &Progress,
+    cli: Cli,
+    today: NaiveDate,
+    source_factory: impl FnMut(
+        SourceKind,
+        &Config,
+        Option<&str>,
+    ) -> Result<Box<dyn ActivitySource>, CommandError>,
+    warnings_writer: &mut impl Write,
+) -> Result<String, CommandError> {
+    let mut warnings = Vec::new();
+    let result = collect_output(progress, cli, today, source_factory, &mut warnings);
+    progress.stop();
+    warnings_writer.write_all(&warnings).map_err(|_| {
+        CommandError::new(
+            ErrorCode::OutputError,
+            "Impossible d'écrire les avertissements sur stderr",
+        )
+    })?;
+    result
+}
+
+fn collect_output(
     progress: &Progress,
     cli: Cli,
     today: NaiveDate,
@@ -239,6 +256,9 @@ fn run_with_warnings(
                 message: error.to_string(),
                 details: serde_json::json!({"sources": selected.iter().map(|source| source.as_str()).collect::<Vec<_>>()}),
             })?;
+            progress.emit(Event::Warnings {
+                count: report.warnings.len(),
+            });
             if !matches!(format, ReportFormat::Json) {
                 write_warnings(warnings_writer, &report.warnings)?;
             }
@@ -263,6 +283,9 @@ fn run_with_warnings(
         .map_err(|error| {
             CommandError::new(ErrorCode::CollectionError, error).source(kind.as_str())
         })?;
+    progress.emit(Event::Warnings {
+        count: activity.warnings.len(),
+    });
     match format {
         ActivityFormat::Json => serde_json::to_string(&activity)
             .map_err(|error| CommandError::new(ErrorCode::OutputError, error)),

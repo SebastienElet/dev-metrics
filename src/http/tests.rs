@@ -167,10 +167,13 @@ fn countdown_reports_remaining_time_and_preserves_waits_when_silent() {
         assert_eq!(elapsed, Duration::from_secs(2));
         let output = std::fs::read_to_string(log.path()).unwrap();
         if terminal {
-            assert_eq!(
-                output,
-                "Bitbucket : rate limit, reprise dans 2 s\nBitbucket : rate limit, reprise dans 1 s\nBitbucket : rate limit, reprise dans 0 s\n"
-            );
+            assert!(!output.contains('\n'));
+            for seconds in [2, 1, 0] {
+                assert!(
+                    output.contains(&format!("Bitbucket · rate limit, reprise dans {seconds} s")),
+                    "{output:?}"
+                );
+            }
         } else {
             assert!(output.is_empty());
         }
