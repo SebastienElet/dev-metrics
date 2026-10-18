@@ -69,6 +69,19 @@ pub enum Event {
         source: Source,
         seconds: u64,
     },
+    EndpointSummary {
+        source: Source,
+        operation: &'static str,
+        requests: usize,
+        pages: usize,
+        elapsed: Duration,
+    },
+    CollectionSummary {
+        source: Source,
+        elapsed: Duration,
+        cache_hits: usize,
+        cache_misses: usize,
+    },
     Calculating,
     Warnings {
         count: usize,
@@ -256,7 +269,11 @@ impl Display {
         let waiting = matches!(event, Event::Waiting { .. });
         let detail = matches!(
             event,
-            Event::Page { .. } | Event::Request { .. } | Event::RateLimit { .. }
+            Event::Page { .. }
+                | Event::Request { .. }
+                | Event::RateLimit { .. }
+                | Event::EndpointSummary { .. }
+                | Event::CollectionSummary { .. }
         );
         if detail && !self.verbose {
             return;
@@ -303,6 +320,27 @@ impl Display {
             Event::Waiting { source, seconds } => {
                 format!("{} : rate limit, reprise dans {seconds} s", source.label())
             }
+            Event::EndpointSummary {
+                source,
+                operation,
+                requests,
+                pages,
+                elapsed,
+            } => format!(
+                "{} : {operation} : {requests} requêtes, {pages} pages, {:.3} s",
+                source.label(),
+                elapsed.as_secs_f64()
+            ),
+            Event::CollectionSummary {
+                source,
+                elapsed,
+                cache_hits,
+                cache_misses,
+            } => format!(
+                "{} : collecte en {:.3} s ; cache : {cache_hits} hits, {cache_misses} miss",
+                source.label(),
+                elapsed.as_secs_f64()
+            ),
             Event::Calculating => "Calcul des métriques".into(),
             Event::Finished { .. } | Event::Warnings { .. } => unreachable!(),
         };

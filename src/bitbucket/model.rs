@@ -36,6 +36,7 @@ pub(super) struct PullRequestDetail {
     pub title: String,
     pub state: PullRequestState,
     pub created_on: DateTime<Utc>,
+    pub updated_on: DateTime<Utc>,
     pub links: Links,
 }
 

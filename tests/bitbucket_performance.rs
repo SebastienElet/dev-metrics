@@ -43,12 +43,16 @@ impl Measurements {
         &self,
         server: &mut Server,
         path: &str,
-        kind: &'static str,
         values: &[Value],
         first_query: Matcher,
         cursor: &str,
         page_size: usize,
     ) {
+        let kind = if path.ends_with("/commits") {
+            "commits"
+        } else {
+            "pullrequests"
+        };
         let pages = values.len().max(1).div_ceil(page_size);
         for page in 0..pages {
             let mut body = json!({
@@ -114,7 +118,6 @@ fn cold_report(days: u64) {
         measurements.pages(
             &mut server,
             &format!("{base}/pullrequests"),
-            "pullrequests",
             &prs,
             Matcher::UrlEncoded("pagelen".into(), "100".into()),
             "all-prs",
@@ -131,7 +134,6 @@ fn cold_report(days: u64) {
         measurements.pages(
             &mut server,
             &format!("{base}/pullrequests"),
-            "pullrequests",
             &filtered,
             Matcher::AllOf(vec![
                 Matcher::UrlEncoded("pagelen".into(), "50".into()),
@@ -177,7 +179,6 @@ fn cold_report(days: u64) {
         measurements.pages(
             &mut server,
             &format!("{base}/commits"),
-            "commits",
             &commits,
             Matcher::UrlEncoded("pagelen".into(), "100".into()),
             "commits",
@@ -226,6 +227,24 @@ fn cold_report(days: u64) {
             duration.as_secs_f64()
         );
     }
+    let (histories, commit_diffs, seconds) = if days == 7 {
+        (15, 42, 10)
+    } else {
+        (60, 180, 30)
+    };
+    for (kind, expected) in [
+        ("identity", 1),
+        ("repositories", 1),
+        ("pullrequests", 3),
+        ("activity", histories),
+        ("comments", histories),
+        ("pr_diffstat", histories),
+        ("commits", 15),
+        ("commit_diffstat", commit_diffs),
+    ] {
+        assert_eq!(counts[kind].0, expected, "{kind}");
+    }
+    assert!(elapsed < Duration::from_secs(seconds), "{elapsed:?}");
 }
 
 #[test]

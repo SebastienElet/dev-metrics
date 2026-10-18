@@ -1,12 +1,14 @@
+use super::rate_limit::RateLimit;
 use crate::activity::Source;
 use crate::progress::{Event, Progress};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, LOCATION};
 use reqwest::{Url, redirect, retry};
 use serde::{Deserialize, de::DeserializeOwned};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub(super) struct Api {
     base: Url,
@@ -14,6 +16,8 @@ pub(super) struct Api {
     token: String,
     email: Option<String>,
     pub progress: Progress,
+    statistics: Mutex<BTreeMap<Endpoint, Statistics>>,
+    rate_limit: Mutex<RateLimit>,
 }
 
 impl Api {
@@ -61,7 +65,32 @@ impl Api {
             token: token.into(),
             email: email.map(str::to_owned),
             progress: Progress::default(),
+            statistics: Mutex::default(),
+            rate_limit: Mutex::default(),
         })
+    }
+
+    pub fn summarize(&self, elapsed: Duration) {
+        for (endpoint, statistics) in self.statistics.lock().unwrap().iter() {
+            self.progress.emit(Event::EndpointSummary {
+                source: Source::Bitbucket,
+                operation: endpoint.label(),
+                requests: statistics.requests,
+                pages: statistics.pages,
+                elapsed: statistics.elapsed,
+            });
+        }
+        self.progress.emit(Event::CollectionSummary {
+            source: Source::Bitbucket,
+            elapsed,
+            cache_hits: 0,
+            cache_misses: 0,
+        });
+    }
+
+    pub fn start_collection(&self) {
+        self.statistics.lock().unwrap().clear();
+        self.rate_limit.lock().unwrap().start_collection();
     }
 
     fn checked_url(&self, url: Url) -> Result<Url, Box<dyn Error>> {
@@ -77,40 +106,23 @@ impl Api {
     }
 
     pub fn get<T: DeserializeOwned>(&self, endpoint: &str) -> Result<T, Box<dyn Error>> {
-        let (body, _) = self.request(self.base.join(endpoint)?, operation(endpoint))?;
+        let (body, _) = self.request(self.base.join(endpoint)?, Endpoint::for_path(endpoint))?;
         Ok(body)
     }
 
     fn request<T: DeserializeOwned>(
         &self,
         mut url: Url,
-        operation: &'static str,
+        endpoint: Endpoint,
     ) -> Result<(T, Url), Box<dyn Error>> {
         let mut visited = BTreeSet::new();
         for _ in 0..=5 {
             url = self.checked_url(url)?;
+            endpoint.select_fields(&mut url);
             if !visited.insert(url.to_string()) {
                 return Err("Redirection Bitbucket cyclique".into());
             }
-            let response = crate::http::get(
-                || {
-                    let request = self.client.get(url.clone());
-                    match &self.email {
-                        Some(email) => request.basic_auth(email, Some(&self.token)),
-                        None => request.bearer_auth(&self.token),
-                    }
-                },
-                Source::Bitbucket,
-                operation,
-                &self.progress,
-            )
-            .map_err(|error| {
-                if error.is_timeout() {
-                    "Bitbucket : timeout"
-                } else {
-                    "Bitbucket : échec réseau"
-                }
-            })?;
+            let response = self.send(&url, endpoint)?;
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -130,12 +142,93 @@ impl Api {
                 )
                 .into());
             }
-            return Ok((
-                response.json().map_err(|_| "Réponse Bitbucket invalide")?,
-                url,
-            ));
+            let started = Instant::now();
+            let body = response.json().map_err(|_| "Réponse Bitbucket invalide");
+            self.statistics
+                .lock()
+                .unwrap()
+                .entry(endpoint)
+                .or_default()
+                .elapsed += started.elapsed();
+            return Ok((body?, url));
         }
         Err("Trop de redirections Bitbucket".into())
+    }
+
+    fn send(&self, url: &Url, endpoint: Endpoint) -> Result<Response, Box<dyn Error>> {
+        for attempt in 0..3 {
+            loop {
+                let delay = self.rate_limit.lock().unwrap().reserve(Instant::now())?;
+                if delay.is_zero() {
+                    break;
+                }
+                self.progress.emit(Event::Waiting {
+                    source: Source::Bitbucket,
+                    seconds: delay.as_secs_f64().ceil() as u64,
+                });
+                std::thread::sleep(delay.min(Duration::from_secs(1)));
+            }
+            self.statistics
+                .lock()
+                .unwrap()
+                .entry(endpoint)
+                .or_default()
+                .requests += 1;
+            self.progress.emit(Event::Request {
+                source: Source::Bitbucket,
+                operation: endpoint.label(),
+            });
+            let started = Instant::now();
+            let request = self.client.get(url.clone());
+            let response = match &self.email {
+                Some(email) => request.basic_auth(email, Some(&self.token)),
+                None => request.bearer_auth(&self.token),
+            }
+            .send();
+            self.statistics
+                .lock()
+                .unwrap()
+                .entry(endpoint)
+                .or_default()
+                .elapsed += started.elapsed();
+            let response = response.map_err(|error| {
+                if error.is_timeout() {
+                    "Bitbucket : timeout"
+                } else {
+                    "Bitbucket : échec réseau"
+                }
+            })?;
+            let number = |name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok())
+            };
+            self.progress.emit(Event::RateLimit {
+                source: Source::Bitbucket,
+                remaining: number("x-ratelimit-remaining"),
+                limit: number("x-ratelimit-limit"),
+                near_limit: response
+                    .headers()
+                    .get("x-ratelimit-nearlimit")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok()),
+            });
+            if response.status() != 429 {
+                return Ok(response);
+            }
+            let delay = self
+                .rate_limit
+                .lock()
+                .unwrap()
+                .defer(response.headers(), attempt)?;
+            self.progress.emit(Event::Waiting {
+                source: Source::Bitbucket,
+                seconds: delay.as_secs(),
+            });
+        }
+        Err("Bitbucket : HTTP 429 après trois tentatives".into())
     }
 
     pub fn list<T: DeserializeOwned>(
@@ -144,21 +237,26 @@ impl Api {
         query: &[(&str, &str)],
     ) -> Result<Vec<T>, Box<dyn Error>> {
         let mut url = self.base.join(endpoint)?;
-        url.query_pairs_mut()
-            .append_pair("pagelen", "100")
-            .extend_pairs(query.iter().copied());
+        url.query_pairs_mut().extend_pairs(query.iter().copied());
         let mut visited = BTreeSet::new();
         let mut expected_size = None;
         let mut items = Vec::new();
         let mut number = 1;
-        let operation = operation(endpoint);
+        let operation = Endpoint::for_path(endpoint);
         loop {
+            operation.select_fields(&mut url);
             if !visited.insert(url.to_string()) {
                 return Err("Pagination Bitbucket cyclique".into());
             }
+            self.statistics
+                .lock()
+                .unwrap()
+                .entry(operation)
+                .or_default()
+                .pages += 1;
             self.progress.emit(Event::Page {
                 source: Source::Bitbucket,
-                operation,
+                operation: operation.label(),
                 number,
             });
             let (page, effective): (Page<T>, _) = self.request(url, operation)?;
@@ -195,17 +293,94 @@ impl Api {
     }
 }
 
-fn operation(endpoint: &str) -> &'static str {
-    match endpoint.split('/').collect::<Vec<_>>().as_slice() {
-        ["user"] | ["users", _] => "identité",
-        ["repositories", _] => "dépôts",
-        ["repositories", _, _, "pullrequests"] => "PRs",
-        ["repositories", _, _, "commits"] => "commits",
-        ["repositories", _, _, "pullrequests", _, "activity"] => "activité PR",
-        ["repositories", _, _, "pullrequests", _, "comments"] => "commentaires",
-        ["repositories", _, _, "pullrequests", _, "diffstat"]
-        | ["repositories", _, _, "diffstat", _] => "fichiers",
-        _ => "ressource",
+#[derive(Default)]
+struct Statistics {
+    requests: usize,
+    pages: usize,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+enum Endpoint {
+    Identity,
+    Repositories,
+    PullRequests,
+    Commits,
+    Activity,
+    Comments,
+    PullRequestDiff,
+    CommitDiff,
+}
+
+impl Endpoint {
+    fn for_path(path: &str) -> Self {
+        match path.split('/').collect::<Vec<_>>().as_slice() {
+            ["repositories", _] => Self::Repositories,
+            ["repositories", _, _, "pullrequests"] => Self::PullRequests,
+            ["repositories", _, _, "commits"] => Self::Commits,
+            ["repositories", _, _, "pullrequests", _, "activity"] => Self::Activity,
+            ["repositories", _, _, "pullrequests", _, "comments"] => Self::Comments,
+            ["repositories", _, _, "pullrequests", _, "diffstat"] => Self::PullRequestDiff,
+            ["repositories", _, _, "diffstat", _] => Self::CommitDiff,
+            _ => Self::Identity,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identité",
+            Self::Repositories => "dépôts",
+            Self::PullRequests => "PRs",
+            Self::Commits => "commits",
+            Self::Activity => "activité PR",
+            Self::Comments => "commentaires",
+            Self::PullRequestDiff => "diffstat PR",
+            Self::CommitDiff => "diffstat commit",
+        }
+    }
+
+    fn fields(self) -> &'static str {
+        match self {
+            Self::Identity => "uuid",
+            Self::Repositories => "next,size,values.full_name",
+            Self::PullRequests => {
+                "next,size,values.id,values.author.uuid,values.title,values.state,values.created_on,values.updated_on,values.links.html.href"
+            }
+            Self::Commits => {
+                "next,size,values.hash,values.author.user.uuid,values.date,values.message,values.links.html.href"
+            }
+            Self::Activity => {
+                "next,size,values.approval.date,values.approval.user.uuid,values.changes_requested.date,values.changes_requested.user.uuid,values.update.date,values.update.state,values.comment.id"
+            }
+            Self::Comments => {
+                "next,size,values.id,values.user.uuid,values.created_on,values.deleted,values.pending,values.inline,values.links.html.href"
+            }
+            Self::PullRequestDiff | Self::CommitDiff => {
+                "next,size,values.old.path,values.new.path,values.lines_added,values.lines_removed"
+            }
+        }
+    }
+
+    fn select_fields(self, url: &mut Url) {
+        let pairs = url
+            .query_pairs()
+            .filter(|(key, _)| key != "fields" && key != "pagelen")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        let mut query = url.query_pairs_mut();
+        query
+            .clear()
+            .extend_pairs(pairs)
+            .append_pair("fields", self.fields());
+        match self {
+            Self::Identity => {}
+            Self::PullRequests => {
+                query.append_pair("pagelen", "50");
+            }
+            _ => {
+                query.append_pair("pagelen", "100");
+            }
+        }
     }
 }
 
