@@ -419,18 +419,32 @@
                   "minLength": 1
                 }
               }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "kind"
+              ],
+              "properties": {
+                "kind": {
+                  "const": "repository"
+                }
+              }
             }
           ]
         },
         "code": {
           "enum": [
+            "ITEM_UNAVAILABLE",
             "FILE_STATISTICS_MISSING",
             "FILE_STATISTICS_MISMATCH",
             "FILE_COUNT_MISMATCH",
             "FILE_LIMIT_REACHED",
             "FILE_PAGINATION_INCOMPLETE",
             "FILE_PAGINATION_INCONSISTENT",
-            "DUPLICATE_FILES"
+            "DUPLICATE_FILES",
+            "COLLECTION_UNAVAILABLE"
           ]
         },
         "message": {

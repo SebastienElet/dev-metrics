@@ -143,6 +143,7 @@ pub struct Commit {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WarningSubject {
+    Repository,
     PullRequest { number: u64 },
     Commit { sha: String },
 }
@@ -150,6 +151,8 @@ pub enum WarningSubject {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum WarningCode {
+    ItemUnavailable,
+    CollectionUnavailable,
     FileStatisticsMissing,
     FileStatisticsMismatch,
     FileCountMismatch,

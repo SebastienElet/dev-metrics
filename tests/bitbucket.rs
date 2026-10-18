@@ -13,10 +13,516 @@ fn source(server: &Server) -> BitbucketSource {
 }
 
 #[test]
+fn a_new_collection_preserves_retry_after_longer_than_the_waiting_budget() {
+    let mut server = Server::new();
+    let limited = server
+        .mock("GET", "/2.0/user")
+        .match_query(Matcher::Any)
+        .with_status(429)
+        .with_header("retry-after", "301")
+        .expect(1)
+        .create();
+    let forbidden = server
+        .mock("GET", "/2.0/user")
+        .match_query(Matcher::Any)
+        .with_body(user("{alice}").to_string())
+        .expect(0)
+        .create();
+    endpoint(&mut server, "/2.0/repositories/team", json!({"values":[]}));
+    let source = source(&server);
+    for _ in 0..2 {
+        let error = source.activity(None, period()).unwrap_err().to_string();
+        assert!(error.contains("429"), "{error}");
+    }
+    limited.assert();
+    forbidden.assert();
+}
+
+#[test]
+fn a_new_collection_can_recover_after_429_without_ignoring_the_last_retry_after() {
+    let mut server = Server::new();
+    let initial = server
+        .mock("GET", "/2.0/user")
+        .match_query(Matcher::Any)
+        .with_status(429)
+        .with_header("retry-after", "0")
+        .expect(2)
+        .create();
+    let exhausted = server
+        .mock("GET", "/2.0/user")
+        .match_query(Matcher::Any)
+        .with_status(429)
+        .with_header("retry-after", "1")
+        .expect(1)
+        .create();
+    let success = endpoint(&mut server, "/2.0/user", user("{alice}"));
+    endpoint(&mut server, "/2.0/repositories/team", json!({"values":[]}));
+    let source = source(&server);
+    assert!(source.activity(None, period()).is_err());
+    let started = std::time::Instant::now();
+    assert_eq!(source.activity(None, period()).unwrap().user, "{alice}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(900));
+    for mock in [initial, exhausted, success] {
+        mock.assert();
+    }
+}
+
+#[test]
+fn rate_limit_cooldown_is_shared_by_all_workers() {
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
+    let mut server = Server::new();
+    repository(
+        &mut server,
+        (1..=12)
+            .map(|id| pr(id, Some("{alice}"), "2026-10-02T00:00:00Z", "OPEN"))
+            .collect(),
+        vec![],
+    );
+    let observed = Arc::new(Mutex::new((None, Vec::new())));
+    for id in 1..=12 {
+        for kind in ["activity", "comments", "diffstat"] {
+            let observed = observed.clone();
+            let attempts = AtomicUsize::new(0);
+            server
+                .mock(
+                    "GET",
+                    format!("/2.0/repositories/team/project/pullrequests/{id}/{kind}").as_str(),
+                )
+                .match_query(Matcher::Any)
+                .with_status_code_from_request(move |_| {
+                    let now = Instant::now();
+                    let mut observed = observed.lock().unwrap();
+                    observed.1.push(now);
+                    if id == 1 && kind == "activity" && attempts.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        observed.0 = Some(now);
+                        429
+                    } else {
+                        200
+                    }
+                })
+                .with_header("retry-after", "1")
+                .with_chunked_body(|writer| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    writer.write_all(b"{\"values\":[]}")
+                })
+                .create();
+        }
+    }
+    assert_eq!(
+        source(&server)
+            .activity(None, period())
+            .unwrap()
+            .pull_requests
+            .len(),
+        12
+    );
+    let observed = observed.lock().unwrap();
+    let limited_at = observed.0.unwrap();
+    assert_eq!(observed.1.len(), 37);
+    assert!(
+        observed.1.iter().all(|time| {
+            let elapsed = time.saturating_duration_since(limited_at);
+            elapsed < Duration::from_millis(150) || elapsed >= Duration::from_secs(1)
+        }),
+        "requests started during the shared cooldown"
+    );
+}
+
+#[test]
+fn every_endpoint_requests_partial_responses_with_pagination_metadata() {
+    use std::sync::{Arc, Mutex};
+    let mut server = Server::new();
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let base = "/2.0/repositories/team/project";
+    let mut mocks = Vec::new();
+    for (path, body) in [
+        ("/2.0/user".into(), user("{alice}")),
+        (
+            "/2.0/repositories/team".into(),
+            json!({"values":[{"full_name":"team/project"}]}),
+        ),
+        (
+            format!("{base}/pullrequests"),
+            json!({"values":[pr(7,Some("{alice}"),"2026-10-02T00:00:00Z","OPEN")]}),
+        ),
+        (
+            format!("{base}/pullrequests/7/activity"),
+            json!({"values":[]}),
+        ),
+        (
+            format!("{base}/pullrequests/7/comments"),
+            json!({"values":[]}),
+        ),
+        (
+            format!("{base}/pullrequests/7/diffstat"),
+            json!({"values":[diff(Some("a.rs"),Some("old.rs"),3,1)]}),
+        ),
+        (
+            format!("{base}/commits"),
+            json!({"values":[commit("abc",Some("{alice}"),"2026-10-02T00:00:00Z")]}),
+        ),
+        (format!("{base}/diffstat/abc"), json!({"values":[]})),
+    ] {
+        let queries = queries.clone();
+        mocks.push(
+            server
+                .mock("GET", path.as_str())
+                .match_query(Matcher::Any)
+                .with_status_code_from_request(move |request| {
+                    queries.lock().unwrap().push(
+                        reqwest::Url::parse(&format!(
+                            "http://localhost{}",
+                            request.path_and_query()
+                        ))
+                        .unwrap(),
+                    );
+                    200
+                })
+                .with_body(body.to_string())
+                .expect(1)
+                .create(),
+        );
+    }
+    assert_eq!(
+        source(&server)
+            .activity(None, period())
+            .unwrap()
+            .pull_requests[0]
+            .additions,
+        3
+    );
+    for mock in mocks {
+        mock.assert();
+    }
+    for url in queries.lock().unwrap().iter() {
+        let fields = url
+            .query_pairs()
+            .find(|(key, _)| key == "fields")
+            .unwrap()
+            .1
+            .into_owned();
+        if url.path() == "/2.0/user" {
+            assert_eq!(fields, "uuid");
+            continue;
+        }
+        let fields = fields.split(',').collect::<Vec<_>>();
+        assert!(fields.contains(&"next") && fields.contains(&"size"));
+        assert!(fields.iter().any(|field| field.starts_with("values.")));
+        assert!(!fields.contains(&"values") && !fields.iter().any(|field| field.contains('*')));
+        let pagelen = url
+            .query_pairs()
+            .find(|(key, _)| key == "pagelen")
+            .unwrap()
+            .1
+            .into_owned();
+        assert_eq!(
+            pagelen,
+            if url.path().ends_with("/pullrequests") {
+                "50"
+            } else {
+                "100"
+            }
+        );
+    }
+}
+
+#[test]
+fn preserves_recent_commits_after_older_pages_in_topological_order() {
+    let mut server = Server::new();
+    endpoint(&mut server, "/2.0/user", user("{alice}"));
+    endpoint(
+        &mut server,
+        "/2.0/repositories/team",
+        json!({"values":[{"full_name":"team/project","updated_on":"2020-01-01T00:00:00Z"}]}),
+    );
+    endpoint(
+        &mut server,
+        "/2.0/repositories/team/project/pullrequests",
+        json!({"values":[]}),
+    );
+    let first = server.mock("GET", "/2.0/repositories/team/project/commits")
+        .match_query(Matcher::Regex("^fields=".into()))
+        .with_body(json!({"values":[commit("abc", Some("{alice}"), "2026-09-01T00:00:00Z")],"next":"?cursor=older-topology","size":2}).to_string()).expect(1).create();
+    let second = server
+        .mock("GET", "/2.0/repositories/team/project/commits")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("cursor".into(), "older-topology".into()),
+            Matcher::Regex("fields=next%2Csize%2Cvalues".into()),
+            Matcher::UrlEncoded("pagelen".into(), "100".into()),
+        ]))
+        .with_body(
+            json!({"values":[commit("def", Some("{alice}"), "2026-10-02T00:00:00Z")],"size":2})
+                .to_string(),
+        )
+        .expect(1)
+        .create();
+    let excluded = server
+        .mock("GET", "/2.0/repositories/team/project/diffstat/abc")
+        .match_query(Matcher::Any)
+        .expect(0)
+        .create();
+    let selected = endpoint(
+        &mut server,
+        "/2.0/repositories/team/project/diffstat/def",
+        json!({"values":[]}),
+    );
+    let activity = source(&server).activity(None, period()).unwrap();
+    assert_eq!(activity.commits.len(), 1);
+    assert_eq!(activity.commits[0].sha, "def");
+    for mock in [first, second, excluded, selected] {
+        mock.assert();
+    }
+}
+
+#[test]
+fn rejects_unsafe_retry_delays_without_retrying_or_disclosing_them() {
+    for delay in ["-1", "301", "9999999999999999999999999", "test-token", ""] {
+        let mut server = Server::new();
+        let limited = server
+            .mock("GET", "/2.0/user")
+            .match_query(Matcher::Any)
+            .with_status(429)
+            .with_header("retry-after", delay)
+            .expect(1)
+            .create();
+        let error = source(&server)
+            .activity(None, period())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("429"));
+        assert!(!error.contains("test-token"));
+        limited.assert();
+    }
+}
+
+#[test]
+fn backs_off_when_retry_after_is_absent() {
+    let mut server = Server::new();
+    let limited = server
+        .mock("GET", "/2.0/user")
+        .match_query(Matcher::Any)
+        .with_status(429)
+        .expect(1)
+        .create();
+    let success = endpoint(&mut server, "/2.0/user", user("{alice}"));
+    endpoint(&mut server, "/2.0/repositories/team", json!({"values":[]}));
+    let started = std::time::Instant::now();
+    assert!(source(&server).activity(None, period()).is_ok());
+    assert!(started.elapsed() >= std::time::Duration::from_secs(1));
+    limited.assert();
+    success.assert();
+}
+
+#[test]
+fn retries_two_rate_limits_and_counts_every_attempt_in_verbose_output() {
+    let mut server = Server::new();
+    let limited = server
+        .mock("GET", "/2.0/user")
+        .match_query(Matcher::Any)
+        .match_header("authorization", "Bearer test-token")
+        .with_status(429)
+        .with_header("retry-after", "0")
+        .expect(2)
+        .create();
+    let success = endpoint(&mut server, "/2.0/user", user("{alice}"));
+    endpoint(&mut server, "/2.0/repositories/team", json!({"values":[]}));
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = dev_metrics::progress::Progress::new(log.reopen().unwrap(), true, false, true);
+    assert!(
+        source(&server)
+            .with_progress(progress)
+            .activity(None, period())
+            .is_ok()
+    );
+    limited.assert();
+    success.assert();
+    assert!(
+        std::fs::read_to_string(log.path())
+            .unwrap()
+            .contains("identité : 3 requêtes, 0 pages")
+    );
+}
+
+#[test]
+fn stops_persistent_rate_limits_after_three_attempts() {
+    let mut server = Server::new();
+    let limited = server
+        .mock("GET", "/2.0/user")
+        .match_query(Matcher::Any)
+        .with_status(429)
+        .with_header("retry-after", "0")
+        .expect(3)
+        .create();
+    let error = source(&server)
+        .activity(None, period())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("429"), "{error}");
+    limited.assert();
+}
+
+#[test]
+fn bounds_the_local_hourly_budget_including_identity_requests() {
+    let mut server = Server::new();
+    let identity = endpoint(&mut server, "/2.0/user", user("{alice}"));
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let pages = server.mock("GET", "/2.0/repositories/team").match_query(Matcher::Any)
+        .with_status_code_from_request(move |_| if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 999 { 200 } else { 500 })
+        .with_body_from_request(|request| {
+            let url = reqwest::Url::parse(&format!("http://localhost{}", request.path_and_query())).unwrap();
+            let page = url.query_pairs().find(|(key, _)| key == "cursor").map_or(0, |(_, value)| value.parse::<usize>().unwrap());
+            json!({"values":[{"full_name":format!("team/project{page}")}], "next":format!("?cursor={}",page+1)}).to_string().into_bytes()
+        }).expect(999).create();
+    let source = source(&server);
+    for _ in 0..2 {
+        let error = source.activity(None, period()).unwrap_err().to_string();
+        assert!(error.contains("1000 requêtes"), "{error}");
+    }
+    identity.assert();
+    pages.assert();
+}
+
+#[test]
+fn verbose_summarizes_attempts_pages_and_collection_time() {
+    let mut server = Server::new();
+    endpoint(&mut server, "/2.0/user", user("{alice}"));
+    endpoint(&mut server, "/2.0/repositories/team", json!({"values":[]}));
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = dev_metrics::progress::Progress::new(log.reopen().unwrap(), true, false, true);
+    source(&server)
+        .with_progress(progress)
+        .activity(None, period())
+        .unwrap();
+    let output = std::fs::read_to_string(log.path()).unwrap();
+    assert!(
+        output.contains("identité : 1 requêtes, 0 pages"),
+        "{output}"
+    );
+    assert!(output.contains("dépôts : 1 requêtes, 1 pages"), "{output}");
+    assert!(output.contains("Bitbucket : collecte en "), "{output}");
+    assert!(output.contains("cache : 0 hits, 0 miss"), "{output}");
+}
+
+#[test]
+fn collects_prs_concurrently_with_at_most_four_in_flight_and_stable_output() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    let mut server = Server::new();
+    repository(
+        &mut server,
+        (1..=12)
+            .map(|id| pr(id, Some("{alice}"), "2026-10-02T00:00:00Z", "OPEN"))
+            .collect(),
+        vec![],
+    );
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let mut mocks = Vec::new();
+    for id in 1..=12 {
+        for kind in ["activity", "comments", "diffstat"] {
+            let active = active.clone();
+            let peak = peak.clone();
+            mocks.push(
+                server
+                    .mock(
+                        "GET",
+                        format!("/2.0/repositories/team/project/pullrequests/{id}/{kind}").as_str(),
+                    )
+                    .match_query(Matcher::Any)
+                    .with_chunked_body(move |writer| {
+                        let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(count, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(30));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        writer.write_all(b"{\"values\":[]}")
+                    })
+                    .expect(1)
+                    .create(),
+            );
+        }
+    }
+    let activity = source(&server).activity(None, period()).unwrap();
+    assert_eq!(
+        activity
+            .pull_requests
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        (1..=12).collect::<Vec<_>>()
+    );
+    assert!(
+        (2..=4).contains(&peak.load(Ordering::SeqCst)),
+        "peak={}",
+        peak.load(Ordering::SeqCst)
+    );
+    for mock in mocks {
+        mock.assert();
+    }
+}
+
+#[test]
+fn excludes_stale_prs_before_fetching_history_and_requests_a_server_date_filter() {
+    let mut server = Server::new();
+    endpoint(&mut server, "/2.0/user", user("{alice}"));
+    endpoint(
+        &mut server,
+        "/2.0/repositories/team",
+        json!({"values":[{"full_name":"team/project"}]}),
+    );
+    let mut stale = pr(7, Some("{alice}"), "2026-01-01T00:00:00Z", "OPEN");
+    stale["updated_on"] = json!("2026-09-30T23:59:59Z");
+    let prs = server
+        .mock("GET", "/2.0/repositories/team/project/pullrequests")
+        .match_query(Matcher::AllOf(vec![
+            Matcher::UrlEncoded("q".into(), "updated_on>=\"2026-10-01T00:00:00Z\"".into()),
+            Matcher::UrlEncoded("pagelen".into(), "50".into()),
+            Matcher::Regex("fields=.*updated_on".into()),
+        ]))
+        .with_body(json!({"values":[stale]}).to_string())
+        .expect(1)
+        .create();
+    let forbidden = ["activity", "comments", "diffstat"].map(|kind| {
+        server
+            .mock(
+                "GET",
+                format!("/2.0/repositories/team/project/pullrequests/7/{kind}").as_str(),
+            )
+            .match_query(Matcher::Any)
+            .expect(0)
+            .create()
+    });
+    endpoint(
+        &mut server,
+        "/2.0/repositories/team/project/commits",
+        json!({"values":[]}),
+    );
+    assert!(
+        source(&server)
+            .activity(None, period())
+            .unwrap()
+            .pull_requests
+            .is_empty()
+    );
+    prs.assert();
+    for mock in forbidden {
+        mock.assert();
+    }
+}
+
+#[test]
 fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
     let mut server = Server::new();
     let limited = server
         .mock("GET", "/2.0/user")
+        .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
         .match_header("authorization", "Bearer test-token")
         .with_status(429)
         .with_header("retry-after", "0")
@@ -39,7 +545,7 @@ fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
     assert!(
         std::fs::read_to_string(log.path())
             .unwrap()
-            .contains("Bitbucket · rate limit, reprise dans 0 s")
+            .contains("Bitbucket · rate limit, reprise dans")
     );
 }
 
@@ -109,6 +615,22 @@ fn progress_tracks_repositories_and_opaque_pages_without_changing_json_or_exposi
     }
 }
 
+fn query_pairs(query: &str) -> Matcher {
+    Matcher::AllOf(
+        query
+            .split('&')
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap();
+                if key == "state" {
+                    Matcher::Regex(format!("(^|&)state={value}(&|$)"))
+                } else {
+                    Matcher::UrlEncoded(key.into(), value.into())
+                }
+            })
+            .collect(),
+    )
+}
+
 fn period() -> Period {
     Period::parse("2026-10-01", "2026-10-07").unwrap()
 }
@@ -151,6 +673,7 @@ fn authenticates_with_atlassian_email_when_configured() {
     let authorization = "Basic YWxpY2VAZXhhbXBsZS50ZXN0OmZha2UtYml0YnVja2V0LXRva2Vu";
     let identity = server
         .mock("GET", "/2.0/user")
+        .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
         .match_header("authorization", authorization)
         .with_header("content-type", "application/json")
         .with_body(user("{alice}").to_string())
@@ -180,6 +703,7 @@ fn basic_auth_survives_rate_limit_retry_and_redirect_with_progress() {
     let authorization = "Basic YWxpY2VAZXhhbXBsZS50ZXN0OmZha2UtYml0YnVja2V0LXRva2Vu";
     let limited = server
         .mock("GET", "/2.0/user")
+        .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
         .match_header("authorization", authorization)
         .with_status(429)
         .with_header("retry-after", "0")
@@ -187,6 +711,7 @@ fn basic_auth_survives_rate_limit_retry_and_redirect_with_progress() {
         .create();
     let redirect = server
         .mock("GET", "/2.0/user")
+        .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
         .match_header("authorization", authorization)
         .with_status(302)
         .with_header("location", "/2.0/identity")
@@ -194,6 +719,7 @@ fn basic_auth_survives_rate_limit_retry_and_redirect_with_progress() {
         .create();
     let identity = server
         .mock("GET", "/2.0/identity")
+        .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
         .match_header("authorization", authorization)
         .with_header("content-type", "application/json")
         .with_body(user("{alice}").to_string())
@@ -221,7 +747,7 @@ fn basic_auth_survives_rate_limit_retry_and_redirect_with_progress() {
     identity.assert();
     repositories.assert();
     let output = std::fs::read_to_string(log.path()).unwrap();
-    assert!(output.contains("Bitbucket · rate limit, reprise dans 0 s"));
+    assert!(output.contains("Bitbucket · rate limit, reprise dans"));
     for secret in ["fake-bitbucket-token", "alice@example.test", authorization] {
         assert!(!output.contains(secret));
     }
@@ -241,6 +767,7 @@ fn refuses_http_and_malformed_responses_without_echoing_secrets() {
         let mut server = Server::new();
         server
             .mock("GET", "/2.0/user")
+            .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
             .with_status(status)
             .with_body(body)
             .create();
@@ -325,8 +852,8 @@ fn repository(server: &mut Server, prs: Vec<Value>, commits: Vec<Value>) {
     );
     server
         .mock("GET", "/2.0/repositories/team/project/pullrequests")
-        .match_query(Matcher::Exact(
-            "pagelen=100&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED".into(),
+        .match_query(query_pairs(
+            "pagelen=50&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED",
         ))
         .with_body(json!({"values":prs}).to_string())
         .create();
@@ -631,7 +1158,7 @@ fn paginates_prs_history_comments_commits_and_diffstats_through_a_redirect() {
     for (path, query, first, second) in [
         (
             "pullrequests",
-            "pagelen=100&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED",
+            "pagelen=50&state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED",
             pr(7, Some("{alice}"), "2026-10-01T00:00:00Z", "OPEN"),
             pr(8, Some("{bob}"), "2026-09-01T00:00:00Z", "OPEN"),
         ),
@@ -664,12 +1191,12 @@ fn paginates_prs_history_comments_commits_and_diffstats_through_a_redirect() {
         let next = format!("{}{path}?cursor=opaque", server.url());
         server
             .mock("GET", path.as_str())
-            .match_query(Matcher::Exact(query.into()))
+            .match_query(query_pairs(query))
             .with_body(json!({"values":[first],"next":next}).to_string())
             .create();
         server
             .mock("GET", path.as_str())
-            .match_query(Matcher::Exact("cursor=opaque".into()))
+            .match_query(query_pairs("cursor=opaque"))
             .with_body(json!({"values":[second]}).to_string())
             .create();
     }
@@ -811,9 +1338,9 @@ fn refuses_cycles_changing_totals_and_truncated_pages() {
         let mut server = Server::new();
         endpoint(&mut server, "/2.0/user", user("{alice}"));
         let base = format!("{}/2.0/repositories/team", server.url());
-        server.mock("GET","/2.0/repositories/team").match_query(Matcher::Exact("pagelen=100".into()))
+        server.mock("GET","/2.0/repositories/team").match_query(Matcher::AllOf(vec![query_pairs("pagelen=100"), Matcher::Regex("^fields=".into())]))
             .with_body(json!({"values":[{"full_name":"team/project"}],"next":format!("{base}?cursor=opaque"),"size":first_size}).to_string()).create();
-        server.mock("GET","/2.0/repositories/team").match_query(Matcher::Exact("cursor=opaque".into()))
+        server.mock("GET","/2.0/repositories/team").match_query(query_pairs("cursor=opaque"))
             .with_body(json!({"values":[{"full_name":"team/second"}],"next":if next_again {Some(format!("{base}?pagelen=100"))} else {None},"size":second_size}).to_string()).create();
         assert!(source(&server).activity(None, period()).is_err());
     }
@@ -966,6 +1493,8 @@ fn excludes_deleted_comments_self_reviews_and_out_of_period_actions() {
 fn malformed_entity_dates_states_and_statistics_are_errors() {
     for (field, value) in [
         ("created_on", json!("not-a-date")),
+        ("updated_on", json!("not-a-date")),
+        ("updated_on", json!(null)),
         ("state", json!("UNKNOWN")),
         ("id", json!(-1)),
     ] {
@@ -998,7 +1527,10 @@ fn malformed_entity_dates_states_and_statistics_are_errors() {
 fn refuses_redirect_cycles_missing_locations_and_network_failures() {
     for location in [None, Some("/2.0/user")] {
         let mut server = Server::new();
-        let mock = server.mock("GET", "/2.0/user").with_status(302);
+        let mock = server
+            .mock("GET", "/2.0/user")
+            .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
+            .with_status(302);
         if let Some(location) = location {
             mock.with_header("location", location).create();
         } else {
@@ -1028,6 +1560,7 @@ fn http_timeout_fails_the_collection() {
     let mut server = Server::new();
     server
         .mock("GET", "/2.0/user")
+        .match_query(Matcher::UrlEncoded("fields".into(), "uuid".into()))
         .with_status_code_from_request(|_| {
             std::thread::sleep(std::time::Duration::from_secs(16));
             200
