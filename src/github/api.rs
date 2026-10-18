@@ -126,9 +126,9 @@ impl Api {
             &|event| self.emit(event),
             Some(&self.quota),
         )
-        .map_err(|error| format!("GitHub {endpoint} : {}", request_error(error)))?;
+        .map_err(|error| request_error(endpoint, error))?;
         if !response.status().is_success() {
-            return Err(format!("GitHub {endpoint} : HTTP {} (vérifiez le token, les permissions et les limites API)", response.status().as_u16()).into());
+            return Err(format!("GitHub {endpoint} : HTTP {}", response.status().as_u16()).into());
         }
         let next = response
             .headers()
@@ -149,11 +149,7 @@ impl Api {
         format!("{}{resource}", self.base)
     }
 
-    pub fn graphql<T: DeserializeOwned>(
-        &self,
-        operation: &str,
-        query: &str,
-    ) -> Result<T, Box<dyn Error>> {
+    pub fn graphql(&self, operation: &str, query: &str) -> Result<GraphData, Box<dyn Error>> {
         let url = self.base.join("graphql")?;
         let body = serde_json::json!({"operationName":operation,"query":query});
         let response = crate::http::send(
@@ -164,19 +160,13 @@ impl Api {
             &|event| self.emit(event),
             Some(&self.quota),
         )
-        .map_err(|error| format!("GitHub GraphQL : {}", request_error(error)))?;
+        .map_err(|error| request_error("GraphQL", error))?;
         if !response.status().is_success() {
             return Err(format!("GitHub GraphQL : HTTP {}", response.status().as_u16()).into());
         }
-        let envelope: GraphResponse<T> = response
+        response
             .json()
-            .map_err(|_| "Réponse GitHub GraphQL invalide")?;
-        if envelope.errors.is_some_and(|errors| !errors.is_empty()) {
-            return Err("GitHub GraphQL : réponse partielle ou erreur de requête".into());
-        }
-        envelope
-            .data
-            .ok_or_else(|| "GitHub GraphQL : données absentes".into())
+            .map_err(|_| "Réponse GitHub GraphQL invalide".into())
     }
 
     pub fn search<T: DeserializeOwned + Serialize + Send>(
@@ -407,15 +397,72 @@ pub(super) struct FileDetail {
 }
 
 #[derive(Deserialize)]
-struct GraphResponse<T> {
-    data: Option<T>,
-    errors: Option<Vec<serde_json::Value>>,
+pub(super) struct GraphData {
+    data: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    errors: Option<Vec<GraphError>>,
 }
 
-fn request_error(error: Box<dyn Error>) -> String {
-    match error.downcast_ref::<reqwest::Error>() {
-        Some(error) if error.is_timeout() => "timeout".into(),
-        Some(_) => "échec réseau".into(),
-        None => error.to_string(),
+#[derive(Deserialize)]
+struct GraphError {
+    path: Option<Vec<serde_json::Value>>,
+}
+
+impl GraphData {
+    pub fn take(&mut self, alias: &str, count: usize) -> Result<serde_json::Value, Box<dyn Error>> {
+        if self.errors.as_ref().is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.first())
+                    .and_then(|part| part.as_str())
+                    .is_none_or(|path| {
+                        path == alias
+                            || path
+                                .strip_prefix('p')
+                                .and_then(|index| index.parse::<usize>().ok())
+                                .is_none_or(|index| index >= count || path != format!("p{index}"))
+                    })
+            })
+        }) {
+            return Err("GitHub GraphQL : élément inaccessible ou réponse partielle".into());
+        }
+        self.data
+            .as_mut()
+            .and_then(|data| data.remove(alias))
+            .filter(|value| !value.is_null())
+            .ok_or_else(|| "GitHub GraphQL : élément absent".into())
     }
+}
+
+#[derive(Debug)]
+struct RequestError {
+    operation: String,
+    cause: Box<dyn Error>,
+}
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "GitHub {} : {}", self.operation, self.cause)
+    }
+}
+impl Error for RequestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.cause.as_ref())
+    }
+}
+
+fn request_error(operation: &str, error: Box<dyn Error>) -> Box<dyn Error> {
+    let cause = match error.downcast::<reqwest::Error>() {
+        Ok(error) if error.is_timeout() => "timeout".into(),
+        Ok(_) => "échec réseau".into(),
+        Err(error) => error,
+    };
+    Box::new(RequestError {
+        operation: operation.into(),
+        cause,
+    })
+}
+
+pub(super) fn is_rate_limit(error: &(dyn Error + 'static)) -> bool {
+    error.is::<crate::http::RateLimitError>() || error.source().is_some_and(is_rate_limit)
 }

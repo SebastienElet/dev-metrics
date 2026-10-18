@@ -4,7 +4,7 @@ use std::path::PathBuf;
 pub mod config;
 pub mod error;
 
-pub const EXIT_HELP: &str = "Sorties : succès sur stdout ; erreurs JSON {code,message,details} sur stderr.\nCodes de sortie : 0 succès/aide ; 1 écriture ; 2 arguments/période ; 3 configuration ; 4 authentification/vérification des accès ; 5 collecte/calcul.\nAucun rapport partiel en cas d'échec de collecte ou de calcul.";
+pub const EXIT_HELP: &str = "Sorties : succès sur stdout ; erreurs JSON {code,message,details} sur stderr.\nCodes de sortie : 0 succès/aide ; 1 écriture ; 2 arguments/période ; 3 configuration ; 4 authentification/vérification des accès ; 5 collecte/calcul.\nLes éléments indisponibles sont signalés par des avertissements ; une erreur bloquante ne produit aucun rapport.";
 
 #[derive(Debug, Parser)]
 #[command(name = "dev-metrics", version, about = "Métriques de développement pour un humain ou un bot LLM", after_help = format!("Exemples :\n  dev-metrics config init\n  dev-metrics report\n  dev-metrics report --format table\n  dev-metrics report --since 2026-10-01 --until 2026-10-15 --format markdown\n  dev-metrics schema\n  dev-metrics github --help\n  dev-metrics bitbucket --help\n  dev-metrics --config ./config.toml report\n\n{EXIT_HELP}"))]

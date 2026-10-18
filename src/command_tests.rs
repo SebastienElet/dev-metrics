@@ -694,3 +694,32 @@ fn partial_statistics_warnings_survive_quiet_and_non_tty_progress() {
         }
     }
 }
+
+#[test]
+fn verbose_lists_json_warnings_and_counts_them_in_the_final_summary() {
+    let (_directory, cli) = cli(&["report", "--verbose"], "");
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = Progress::new(log.reopen().unwrap(), true, false, true);
+    let output = run_with_warnings(
+        &progress,
+        cli,
+        today(),
+        |_, _, _| Ok(Box::new(WarningSource)),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    progress.emit(Event::Finished {
+        elapsed: std::time::Duration::from_secs(1),
+        success: true,
+    });
+    let warnings = serde_json::from_str::<Value>(&output).unwrap()["warnings"]
+        .as_array()
+        .unwrap()
+        .len();
+    let stderr = std::fs::read_to_string(log.path()).unwrap();
+    assert!(
+        stderr.contains(&format!("{warnings} avertissement")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("FILE_STATISTICS_MISMATCH"), "{stderr}");
+}

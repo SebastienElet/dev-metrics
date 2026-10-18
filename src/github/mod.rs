@@ -3,6 +3,7 @@ mod auth;
 mod cache;
 mod graphql;
 mod parallel;
+mod recovery;
 
 pub use crate::activity::*;
 use crate::progress::{Event, Progress};
@@ -146,37 +147,54 @@ impl Collector {
             kind: "PRs et issues",
             count: candidates.len(),
         });
-        let mut snapshots = graphql::snapshots(&self.api, &candidates)?;
+        let snapshots = graphql::snapshots(&self.api, &candidates)?;
+        activity.warnings.extend(snapshots.warnings);
+        let mut snapshots = snapshots.items;
         let discussions = candidates
             .iter()
             .filter(|(_, issue)| issue.pull_request.is_none() && issue.comments > 0)
             .collect::<Vec<_>>();
-        let mut discussions = parallel::collect(discussions, |(key, issue)| {
-            let slot = self
-                .api
-                .cache_key(&format!("{}/{}/discussion", key.0, key.1));
-            let version = format!("{slot}/{}", issue.updated_at);
-            let comments = match self
-                .api
-                .cache
-                .as_ref()
-                .and_then(|cache| cache.read::<Vec<CommentDetail>>(&slot, &version))
-            {
-                Some(comments) => comments,
-                None => {
-                    let comments: Vec<CommentDetail> = self
-                        .api
-                        .list(&format!("repos/{}/issues/{}/comments", key.0, key.1))?;
-                    if let Some(cache) = &self.api.cache {
-                        cache.write(&slot, &version, &comments);
+        let discussions = parallel::collect(discussions, |(key, issue)| {
+            let mut warnings = Vec::new();
+            let result = (|| {
+                let slot = self
+                    .api
+                    .cache_key(&format!("{}/{}/discussion", key.0, key.1));
+                let version = format!("{slot}/{}", issue.updated_at);
+                let comments = match self
+                    .api
+                    .cache
+                    .as_ref()
+                    .and_then(|cache| cache.read::<Vec<CommentDetail>>(&slot, &version))
+                {
+                    Some(comments) => comments,
+                    None => {
+                        let comments: Vec<CommentDetail> = self
+                            .api
+                            .list(&format!("repos/{}/issues/{}/comments", key.0, key.1))?;
+                        if let Some(cache) = &self.api.cache {
+                            cache.write(&slot, &version, &comments);
+                        }
+                        comments
                     }
-                    comments
-                }
-            };
-            Ok((key.clone(), comments))
-        })?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
+                };
+                Ok(comments)
+            })();
+            let comments = recovery::item(
+                result,
+                &key.0,
+                WarningSubject::Issue { number: key.1 },
+                &mut warnings,
+            )?;
+            Ok((key.clone(), comments, warnings))
+        })?;
+        let mut discussion_items = BTreeMap::new();
+        for (key, comments, warnings) in discussions {
+            activity.warnings.extend(warnings);
+            if let Some(comments) = comments {
+                discussion_items.insert(key, comments);
+            }
+        }
         let mut relevant = Vec::new();
         let total = candidates
             .keys()
@@ -202,7 +220,7 @@ impl Collector {
                 });
             }
             if issue.pull_request.is_none() {
-                if let Some(comments) = discussions.remove(&(repository.clone(), number)) {
+                if let Some(comments) = discussion_items.remove(&(repository.clone(), number)) {
                     self.record_comments(
                         &mut activity,
                         &repository,
@@ -213,9 +231,9 @@ impl Collector {
                 }
                 continue;
             }
-            let snapshot = snapshots
-                .remove(&(repository.clone(), number))
-                .ok_or("Données de PR absentes")?;
+            let Some(snapshot) = snapshots.remove(&(repository.clone(), number)) else {
+                continue;
+            };
             self.record_comments(
                 &mut activity,
                 &repository,
@@ -306,90 +324,122 @@ impl Collector {
             .map(|(repository, number, ..)| (repository.clone(), *number))
             .collect::<Vec<_>>();
         let graph_files = graphql::files(&self.api, &keys, &candidates)?;
+        let unavailable = graph_files
+            .warnings
+            .iter()
+            .filter_map(|warning| match warning.subject {
+                WarningSubject::PullRequest { number } => {
+                    Some((warning.repository.clone(), number))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        activity.warnings.extend(graph_files.warnings);
+        relevant.retain(|(repository, number, ..)| {
+            !unavailable.contains(&(repository.clone(), *number))
+        });
         let pulls = parallel::collect(
             relevant,
             |(repository, number, detail, author, first_review_received_at)| {
-                let mut collected = Activity::empty(Source::GitHub, user, activity.period.clone());
-                let endpoint = format!("repos/{repository}/pulls/{number}");
-                let subject = WarningSubject::PullRequest { number };
-                if detail.changed_files > 3000 {
-                    collected.warnings.push(warning(
-                        &repository,
-                        &subject,
-                        WarningCode::FileLimitReached,
-                        format!(
-                            "{} fichiers annoncés ; GitHub limite le détail à 3000 fichiers",
-                            detail.changed_files
-                        ),
-                    ));
-                }
-                let mut files = graph_files.get(&(repository.clone(), number)).cloned();
-                if files.is_none() {
-                    let warnings_before = collected.warnings.len();
-                    let mut pages = Vec::new();
-                    for page_number in 1..=30 {
-                        let (page, next): (Vec<FileDetail>, _) = self.api.get(
-                            &format!("{endpoint}/files"),
-                            &[
-                                ("per_page", "100".into()),
-                                ("page", page_number.to_string()),
-                            ],
-                        )?;
-                        let empty = page.is_empty();
-                        pages.extend(page);
-                        if !next {
-                            break;
-                        }
-                        if empty || pages.len() >= 3000 || page_number == 30 {
-                            collected.warnings.push(warning(
+                let warning_repository = repository.clone();
+                let mut warnings = Vec::new();
+                let result = (|| {
+                    let mut collected =
+                        Activity::empty(Source::GitHub, user, activity.period.clone());
+                    let endpoint = format!("repos/{repository}/pulls/{number}");
+                    let subject = WarningSubject::PullRequest { number };
+                    if detail.changed_files > 3000 {
+                        collected.warnings.push(warning(
+                            &repository,
+                            &subject,
+                            WarningCode::FileLimitReached,
+                            format!(
+                                "{} fichiers annoncés ; GitHub limite le détail à 3000 fichiers",
+                                detail.changed_files
+                            ),
+                        ));
+                    }
+                    let mut files = graph_files
+                        .items
+                        .get(&(repository.clone(), number))
+                        .cloned();
+                    if files.is_none() {
+                        let warnings_before = collected.warnings.len();
+                        let mut pages = Vec::new();
+                        for page_number in 1..=30 {
+                            let (page, next): (Vec<FileDetail>, _) = self.api.get(
+                                &format!("{endpoint}/files"),
+                                &[
+                                    ("per_page", "100".into()),
+                                    ("page", page_number.to_string()),
+                                ],
+                            )?;
+                            let empty = page.is_empty();
+                            pages.extend(page);
+                            if !next {
+                                break;
+                            }
+                            if empty || pages.len() >= 3000 || page_number == 30 {
+                                collected.warnings.push(warning(
                                 &repository,
                                 &subject,
                                 WarningCode::FilePaginationIncomplete,
                                 "Pagination des fichiers de PR interrompue avant la dernière page",
                             ));
-                            break;
+                                break;
+                            }
                         }
+                        if collected.warnings.len() == warnings_before
+                            && detail.changed_files == pages.len()
+                        {
+                            let key = (repository.clone(), number);
+                            graphql::cache_files(&self.api, &key, &candidates[&key], &pages);
+                        }
+                        files = Some(pages);
                     }
-                    if collected.warnings.len() == warnings_before
-                        && detail.changed_files == pages.len()
-                    {
-                        let key = (repository.clone(), number);
-                        graphql::cache_files(&self.api, &key, &candidates[&key], &pages);
-                    }
-                    files = Some(pages);
-                }
-                let files = file_changes(
-                    &mut collected,
-                    &repository,
-                    &subject,
-                    files.unwrap(),
-                    detail.additions,
-                    detail.deletions,
-                );
-                if detail.changed_files != files.len() {
-                    collected.warnings.push(warning(&repository, &subject, WarningCode::FileCountMismatch,
+                    let files = file_changes(
+                        &mut collected,
+                        &repository,
+                        &subject,
+                        files.unwrap(),
+                        detail.additions,
+                        detail.deletions,
+                    );
+                    if detail.changed_files != files.len() {
+                        collected.warnings.push(warning(&repository, &subject, WarningCode::FileCountMismatch,
                         format!("{} fichiers annoncés, {} fichiers disponibles ; exclusions limitées aux fichiers disponibles", detail.changed_files, files.len())));
-                }
-                collected.pull_requests.push(PullRequest {
-                    source: Source::GitHub,
-                    repository,
-                    number: detail.number,
-                    author,
-                    title: detail.title,
-                    url: detail.html_url,
-                    created_at: detail.created_at,
-                    merged_at: detail.merged_at,
-                    first_review_received_at,
-                    additions: detail.additions,
-                    deletions: detail.deletions,
-                    files,
-                });
-                Ok(collected)
+                    }
+                    collected.pull_requests.push(PullRequest {
+                        source: Source::GitHub,
+                        repository,
+                        number: detail.number,
+                        author,
+                        title: detail.title,
+                        url: detail.html_url,
+                        created_at: detail.created_at,
+                        merged_at: detail.merged_at,
+                        first_review_received_at,
+                        additions: detail.additions,
+                        deletions: detail.deletions,
+                        files,
+                    });
+                    Ok(collected)
+                })();
+                let collected = recovery::item(
+                    result,
+                    &warning_repository,
+                    WarningSubject::PullRequest { number },
+                    &mut warnings,
+                )?;
+                Ok((collected, warnings))
             },
         )?;
-        for collected in pulls {
-            activity.pull_requests.extend(collected.pull_requests);
-            activity.warnings.extend(collected.warnings);
+        for (collected, warnings) in pulls {
+            activity.warnings.extend(warnings);
+            if let Some(collected) = collected {
+                activity.pull_requests.extend(collected.pull_requests);
+                activity.warnings.extend(collected.warnings);
+            }
         }
         let query = format!(
             "author:{user} author-date:{}..{}",
@@ -422,8 +472,22 @@ impl Collector {
             current: 0,
             total,
         });
+        for (repository, sha) in &commit_keys {
+            api::validate_repository(repository)?;
+            if sha.is_empty() || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return Err("SHA GitHub invalide".into());
+            }
+        }
         let commits = parallel::collect(commit_keys.into_iter().collect(), |(repository, sha)| {
-            self.commit(user, &activity.period, repository, sha)
+            let mut warnings = Vec::new();
+            let result = self.commit(user, &activity.period, repository.clone(), sha.clone());
+            let collected = recovery::item(
+                result,
+                &repository,
+                WarningSubject::Commit { sha },
+                &mut warnings,
+            )?;
+            Ok((collected, warnings))
         })?;
         self.api.emit(Event::Repositories {
             source: Source::GitHub,
@@ -431,10 +495,33 @@ impl Collector {
             current: total,
             total,
         });
-        for collected in commits {
-            activity.commits.extend(collected.commits);
-            activity.warnings.extend(collected.warnings);
+        for (collected, warnings) in commits {
+            activity.warnings.extend(warnings);
+            if let Some(collected) = collected {
+                activity.commits.extend(collected.commits);
+                activity.warnings.extend(collected.warnings);
+            }
         }
+        let unavailable = activity
+            .warnings
+            .iter()
+            .filter(|warning| warning.code == WarningCode::ItemUnavailable)
+            .filter_map(|warning| match warning.subject {
+                WarningSubject::PullRequest { number } => {
+                    Some((warning.repository.clone(), number))
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        activity.comments.retain(|comment| {
+            !unavailable.contains(&(comment.repository.clone(), comment.issue_number))
+        });
+        activity.reviews_given.retain(|review| {
+            !unavailable.contains(&(review.repository.clone(), review.pull_request_number))
+        });
+        activity.reviews_received.retain(|review| {
+            !unavailable.contains(&(review.repository.clone(), review.pull_request_number))
+        });
         Ok(activity)
     }
 

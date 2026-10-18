@@ -1,5 +1,5 @@
 use crate::activity::Source;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::rc::Rc;
 use std::time::Duration;
@@ -8,6 +8,7 @@ use std::time::Duration;
 pub struct Progress {
     output: Option<Rc<RefCell<Box<dyn Write>>>>,
     verbose: bool,
+    warnings: Rc<Cell<usize>>,
 }
 
 pub enum Event {
@@ -35,6 +36,19 @@ pub enum Event {
         limit: Option<u64>,
         near_limit: Option<bool>,
     },
+    Quota {
+        source: Source,
+        resource: &'static str,
+        remaining: Option<u64>,
+        reset: Option<u64>,
+    },
+    QuotaWaiting {
+        source: Source,
+        resource: &'static str,
+        remaining: Option<u64>,
+        reset: Option<u64>,
+        seconds: u64,
+    },
     Waiting {
         source: Source,
         seconds: u64,
@@ -53,6 +67,9 @@ pub enum Event {
         calls: std::collections::BTreeMap<&'static str, usize>,
         waited: Duration,
     },
+    Warning {
+        warning: crate::activity::ActivityWarning,
+    },
     Calculating,
     Finished {
         elapsed: Duration,
@@ -66,10 +83,14 @@ impl Progress {
             output: (terminal && !quiet)
                 .then(|| Rc::new(RefCell::new(Box::new(writer) as Box<dyn Write>))),
             verbose,
+            warnings: Rc::default(),
         }
     }
 
     pub fn emit(&self, event: Event) {
+        if matches!(event, Event::Warning { .. }) {
+            self.warnings.set(self.warnings.get() + 1);
+        }
         let Some(output) = &self.output else {
             return;
         };
@@ -118,6 +139,34 @@ impl Progress {
                 )
             }
             Event::Request { .. } | Event::RateLimit { .. } => return,
+            Event::Quota {
+                source,
+                resource,
+                remaining,
+                reset,
+            } if self.verbose => {
+                format!(
+                    "{} : quota {resource}, restant {}, reset {}",
+                    source.label(),
+                    remaining.map_or_else(|| "inconnu".into(), |n| n.to_string()),
+                    reset_time(reset)
+                )
+            }
+            Event::Quota { .. } => return,
+            Event::QuotaWaiting {
+                source,
+                resource,
+                remaining,
+                reset,
+                seconds,
+            } => {
+                format!(
+                    "{} : rate limit, reprise dans {seconds} s ({resource}, restant {}, reset {})",
+                    source.label(),
+                    remaining.map_or_else(|| "inconnu".into(), |n| n.to_string()),
+                    reset_time(reset)
+                )
+            }
             Event::Waiting { source, seconds } => {
                 format!("{} : rate limit, reprise dans {seconds} s", source.label())
             }
@@ -139,27 +188,60 @@ impl Progress {
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!(
-                    "{} : appels [{calls}], attente rate limit={:.2} s",
+                    "{} : appels [{calls}], attente rate limit={:.2} s cumulées",
                     source.label(),
                     waited.as_secs_f64()
                 )
             }
             Event::Candidates { .. } | Event::Waited { .. } | Event::Statistics { .. } => return,
+            Event::Warning { warning } if self.verbose => {
+                format!(
+                    "{} : avertissement {}",
+                    warning.source.label(),
+                    serde_json::to_string(&warning).unwrap_or_default()
+                )
+            }
+            Event::Warning { .. } => return,
             Event::Calculating => "Calcul des métriques".into(),
             Event::Finished { elapsed, success } => format!(
-                "{} {:.2} s",
+                "{} {:.2} s{}",
                 if success {
                     "Terminé en"
                 } else {
                     "Échec après"
                 },
-                elapsed.as_secs_f64()
+                elapsed.as_secs_f64(),
+                if self.warnings.get() == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} avertissement{}",
+                        self.warnings.get(),
+                        if self.warnings.get() == 1 { "" } else { "s" }
+                    )
+                }
             ),
         };
         let mut output = output.borrow_mut();
         let _ = writeln!(output, "{message}");
         let _ = output.flush();
     }
+}
+
+pub(crate) fn reset_time(reset: Option<u64>) -> String {
+    reset
+        .and_then(|value| i64::try_from(value).ok())
+        .and_then(|value| chrono::DateTime::from_timestamp(value, 0))
+        .map_or_else(
+            || "inconnu".into(),
+            |date| {
+                format!(
+                    "{} UTC (epoch {})",
+                    date.format("%Y-%m-%d %H:%M:%S"),
+                    date.timestamp()
+                )
+            },
+        )
 }
 
 #[cfg(test)]

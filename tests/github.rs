@@ -113,7 +113,7 @@ fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
     assert!(
         std::fs::read_to_string(log.path())
             .unwrap()
-            .contains("GitHub : rate limit, reprise dans 0 s")
+            .contains("GitHub : rate limit, reprise dans")
     );
 }
 
@@ -779,19 +779,28 @@ fn reports_http_malformed_json_and_connection_failures_without_echoing_secrets()
         (200, "{\"items\":[]}"),
     ] {
         let mut server = Server::new();
-        server
+        let mut response = server
             .mock("GET", "/search/issues")
             .match_query(Matcher::Any)
             .with_status(status)
-            .with_body(body)
-            .create();
+            .with_body(body);
+        if status == 429 {
+            response = response.with_header("retry-after", "301");
+        }
+        response.create();
         let error = source(&server)
             .activity("octocat", period())
             .unwrap_err()
             .to_string();
         assert!(!error.contains("test-token"), "{error}");
         assert!(
-            error.contains(if status == 200 { "invalide" } else { "HTTP" }),
+            error.contains(if status == 200 {
+                "invalide"
+            } else if status == 429 {
+                "limite de débit"
+            } else {
+                "HTTP"
+            }),
             "{error}"
         );
     }
@@ -957,7 +966,7 @@ fn excludes_self_reviews_and_activity_outside_the_period() {
 }
 
 #[test]
-fn rejects_malformed_review_timestamps_and_unknown_review_states() {
+fn warns_and_skips_prs_with_malformed_review_timestamps_or_unknown_states() {
     for (submitted, state) in [
         (Some("not-a-date"), "APPROVED"),
         (None, "APPROVED"),
@@ -979,7 +988,13 @@ fn rejects_malformed_review_timestamps_and_unknown_review_states() {
             vec![],
             vec![],
         );
-        assert!(source(&server).activity("octocat", period()).is_err());
+        let activity = source(&server).activity("octocat", period()).unwrap();
+        assert!(activity.pull_requests.is_empty());
+        assert_eq!(activity.warnings.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&activity).unwrap()["warnings"][0]["code"],
+            "ITEM_UNAVAILABLE"
+        );
     }
 }
 
@@ -1143,13 +1158,10 @@ fn refuses_empty_list_pages_with_a_next_link() {
         .with_header("content-type", "application/json")
         .with_body("[]")
         .create();
-    assert!(
-        source(&server)
-            .activity("octocat", period())
-            .unwrap_err()
-            .to_string()
-            .contains("vide")
-    );
+    let activity = source(&server).activity("octocat", period()).unwrap();
+    assert!(activity.comments.is_empty());
+    assert_eq!(activity.warnings.len(), 1);
+    assert!(activity.warnings[0].message.contains("vide"));
 }
 
 fn commit_detail(files: Vec<Value>) -> Value {
@@ -1628,7 +1640,7 @@ fn duplicate_paginated_files_are_excluded_only_once() {
 }
 
 #[test]
-fn http_and_invalid_response_errors_during_commit_pagination_still_fail_collection() {
+fn commit_detail_failures_warn_but_unwaitable_rate_limits_remain_fatal() {
     for status in [401, 403, 429, 500, 200] {
         let mut server = Server::new();
         commit_search(&mut server);
@@ -1641,27 +1653,31 @@ fn http_and_invalid_response_errors_during_commit_pagination_still_fail_collecti
             .with_header("content-type", "application/json")
             .with_body(partial_diff("commit_pages")[0].to_string())
             .create();
-        server
+        let mut detail = server
             .mock(
                 "GET",
                 "/repos/octocat/project/commits/abc123?per_page=100&page=2",
             )
             .with_status(status)
             .with_header("content-type", "application/json")
-            .with_body("invalid")
-            .create();
-        let error = source(&server)
-            .activity("octocat", period())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains(if status == 200 {
+            .with_body("invalid");
+        if status == 429 {
+            detail = detail.with_header("retry-after", "301");
+        }
+        detail.create();
+        let result = source(&server).activity("octocat", period());
+        if status == 429 {
+            assert!(result.unwrap_err().to_string().contains("limite de débit"));
+        } else {
+            let activity = result.unwrap();
+            assert!(activity.commits.is_empty());
+            assert_eq!(activity.warnings.len(), 1);
+            assert!(activity.warnings[0].message.contains(if status == 200 {
                 "Réponse GitHub invalide"
             } else {
                 "HTTP"
-            }),
-            "{error}"
-        );
+            }));
+        }
     }
 }
 
@@ -1689,6 +1705,8 @@ fn verbose_measures_endpoint_attempts_candidates_and_rate_limit_waits() {
         .match_query(Matcher::Any)
         .with_status(429)
         .with_header("retry-after", "0")
+        .with_header("x-ratelimit-remaining", "0")
+        .with_header("x-ratelimit-reset", "0")
         .expect(1)
         .create();
     let issues = server

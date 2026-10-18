@@ -243,7 +243,7 @@ fn cached_issue_comments_preserve_comments_left_without_reloading() {
 }
 
 #[test]
-fn graphql_errors_missing_nodes_and_invalid_ids_fail_without_caching_or_echoing_payloads() {
+fn graphql_errors_missing_nodes_and_invalid_ids_warn_without_caching_or_echoing_payloads() {
     let mut invalid = pull_request(1);
     invalid["discussion"] = connection(vec![
         json!({"id":"test-token","user":{"login":"octocat"},"created_at":"2026-10-02T00:00:00Z","html_url":"https://github.com/team/project/pull/1"}),
@@ -254,6 +254,7 @@ fn graphql_errors_missing_nodes_and_invalid_ids_fail_without_caching_or_echoing_
     ]);
     for body in [
         json!({"errors":[{"message":"test-token"}],"data":{"p0":{"pullRequest":pull_request(1)}}}),
+        json!({"data":{"p0":{"pullRequest":pull_request(1)}},"errors":[{"path":["unexpected_alias"],"message":"test-token"}]}),
         json!({"data":null}),
         json!({"data":{}}),
         json!({"data":{"p0":{"pullRequest":null}}}),
@@ -267,16 +268,21 @@ fn graphql_errors_missing_nodes_and_invalid_ids_fail_without_caching_or_echoing_
             .with_body(body.to_string())
             .create();
         let cache = tempfile::tempdir().unwrap();
-        let error = GitHubSource::new(server.url().parse().unwrap(), "test-token")
+        let activity = GitHubSource::new(server.url().parse().unwrap(), "test-token")
             .unwrap()
             .with_cache(cache.path().into())
             .activity(
                 "octocat",
                 Period::parse("2026-10-01", "2026-10-07").unwrap(),
             )
-            .unwrap_err()
-            .to_string();
-        assert!(!error.contains("test-token"), "{error}");
+            .unwrap();
+        assert!(activity.pull_requests.is_empty());
+        assert_eq!(activity.warnings.len(), 1);
+        assert!(
+            !serde_json::to_string(&activity)
+                .unwrap()
+                .contains("test-token")
+        );
         assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 }

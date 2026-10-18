@@ -3,8 +3,10 @@ use crate::progress::Event;
 use reqwest::blocking::{RequestBuilder, Response};
 use reqwest::header::HeaderMap;
 use std::error::Error;
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod github;
+pub(crate) use github::{RateLimit, RateLimitError, send};
 
 pub(crate) fn get(
     request: impl Fn() -> RequestBuilder,
@@ -12,84 +14,14 @@ pub(crate) fn get(
     operation: &'static str,
     progress: &impl Fn(Event),
 ) -> Result<Response, Box<dyn Error>> {
-    send(request, source, operation, "GET", progress, None)
-}
-
-#[derive(Default)]
-pub(crate) struct RateLimit {
-    state: Mutex<Quota>,
-}
-
-#[derive(Default)]
-struct Quota {
-    until: Option<Instant>,
-    stopped: bool,
-}
-
-impl RateLimit {
-    fn wait(&self, source: Source, progress: &impl Fn(Event)) -> Result<(), Box<dyn Error>> {
-        let mut quota = self
-            .state
-            .lock()
-            .map_err(|_| "Coordination du débit interrompue")?;
-        if quota.stopped {
-            return Err("collecte arrêtée par la limite de débit".into());
-        }
-        if let Some(until) = quota.until.take() {
-            let delay = until.saturating_duration_since(Instant::now());
-            let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
-            if seconds > 300 {
-                quota.stopped = true;
-                return Err(
-                    "limite de débit, attente supérieure à 300 s ; relancez plus tard".into(),
-                );
-            }
-            wait_for_retry(progress, source, seconds, std::thread::sleep);
-        }
-        Ok(())
-    }
-
-    fn observe(&self, response: &Response, source: Source) {
-        let limited = matches!(response.status().as_u16(), 403 | 429);
-        if !limited && header_number(response.headers(), "x-ratelimit-remaining") != Some(0) {
-            return;
-        }
-        let seconds = retry_seconds(response.headers(), source, SystemTime::now());
-        let until =
-            seconds.and_then(|seconds| Instant::now().checked_add(Duration::from_secs(seconds)));
-        if let Ok(mut quota) = self.state.lock() {
-            match until {
-                Some(until) => {
-                    quota.until = Some(quota.until.map_or(until, |previous| previous.max(until)))
-                }
-                None => quota.stopped = true,
-            }
-        }
-    }
-}
-
-pub(crate) fn send(
-    request: impl Fn() -> RequestBuilder,
-    source: Source,
-    operation: &'static str,
-    method: &'static str,
-    progress: &impl Fn(Event),
-    quota: Option<&RateLimit>,
-) -> Result<Response, Box<dyn Error>> {
     let mut retried = false;
     loop {
-        if let Some(quota) = quota {
-            quota.wait(source, progress)?;
-        }
         progress(Event::Request {
             source,
             operation,
-            method,
+            method: "GET",
         });
         let response = request().send()?;
-        if let Some(quota) = quota {
-            quota.observe(&response, source);
-        }
         let headers = response.headers();
         progress(Event::RateLimit {
             source,
@@ -111,9 +43,7 @@ pub(crate) fn send(
             return Ok(response);
         };
         drop(response);
-        if quota.is_none() {
-            wait_for_retry(progress, source, seconds, std::thread::sleep);
-        }
+        wait_for_retry(progress, source, seconds, std::thread::sleep);
         retried = true;
     }
 }

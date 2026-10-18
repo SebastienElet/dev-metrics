@@ -250,6 +250,11 @@ fn run_with_warnings(
                 message: error.to_string(),
                 details: serde_json::json!({"sources": selected.iter().map(|source| source.as_str()).collect::<Vec<_>>()}),
             })?;
+            for warning in &report.warnings {
+                progress.emit(Event::Warning {
+                    warning: warning.clone(),
+                });
+            }
             if !matches!(format, ReportFormat::Json) {
                 write_warnings(warnings_writer, &report.warnings)?;
             }
@@ -274,6 +279,11 @@ fn run_with_warnings(
         .map_err(|error| {
             CommandError::new(ErrorCode::CollectionError, error).source(kind.as_str())
         })?;
+    for warning in &activity.warnings {
+        progress.emit(Event::Warning {
+            warning: warning.clone(),
+        });
+    }
     match format {
         ActivityFormat::Json => serde_json::to_string(&activity)
             .map_err(|error| CommandError::new(ErrorCode::OutputError, error)),

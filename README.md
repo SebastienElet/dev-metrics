@@ -64,3 +64,9 @@ simultanées. `--verbose` affiche les candidats, les appels par endpoint et les 
 de limite de débit. Le cache local `~/.cache/dev-metrics` réutilise les PR et issues
 inchangées (`updated_at`) et les commits par SHA ; `--no-cache` désactive sa lecture
 et son écriture. Les recherches restent fraîches à chaque lancement.
+
+Les limites de débit GitHub déclenchent jusqu’à quatre tentatives, avec un budget
+d’attente de 300 s par requête ; en cas d’arrêt, l’heure de reprise est indiquée
+lorsqu’elle peut être déterminée.
+Un détail indisponible écarte la PR, le commit ou l’issue concerné ; l’avertissement
+figure dans le JSON, dans `--verbose` et dans le compte final des avertissements.

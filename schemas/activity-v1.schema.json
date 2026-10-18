@@ -395,7 +395,7 @@
               ],
               "properties": {
                 "kind": {
-                  "const": "pull_request"
+                  "enum": ["pull_request", "issue"]
                 },
                 "number": {
                   "type": "integer",
@@ -424,6 +424,7 @@
         },
         "code": {
           "enum": [
+            "ITEM_UNAVAILABLE",
             "FILE_STATISTICS_MISSING",
             "FILE_STATISTICS_MISMATCH",
             "FILE_COUNT_MISMATCH",
