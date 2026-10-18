@@ -1,13 +1,44 @@
 use crate::activity::Source;
-use std::cell::RefCell;
 use std::io::Write;
-use std::rc::Rc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+const TICK_INTERVAL: Duration = Duration::from_millis(90);
+const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const CLEAR_LINE: &str = "\r\x1b[2K";
 
 #[derive(Clone, Default)]
 pub struct Progress {
-    output: Option<Rc<RefCell<Box<dyn Write>>>>,
+    session: Option<Arc<Session>>,
+}
+
+struct Session {
+    display: Arc<Mutex<Display>>,
+    ticker: Mutex<Option<Ticker>>,
+}
+
+struct Ticker {
+    stop: mpsc::Sender<()>,
+    worker: JoinHandle<()>,
+}
+
+struct Display {
+    writer: Box<dyn Write + Send>,
+    clock: Box<dyn Fn() -> Duration + Send>,
     verbose: bool,
+    message: Option<String>,
+    waiting: Option<String>,
+    frame: usize,
+    state: DisplayState,
+    warnings: usize,
+}
+
+#[derive(PartialEq, Eq)]
+enum DisplayState {
+    Running,
+    Stopped,
+    Finished,
 }
 
 pub enum Event {
@@ -39,6 +70,9 @@ pub enum Event {
         seconds: u64,
     },
     Calculating,
+    Warnings {
+        count: usize,
+    },
     Finished {
         elapsed: Duration,
         success: bool,
@@ -46,18 +80,187 @@ pub enum Event {
 }
 
 impl Progress {
-    pub fn new(writer: impl Write + 'static, terminal: bool, quiet: bool, verbose: bool) -> Self {
+    pub fn new(
+        writer: impl Write + Send + 'static,
+        terminal: bool,
+        quiet: bool,
+        verbose: bool,
+    ) -> Self {
+        let started = Instant::now();
+        let progress =
+            Self::with_clock(writer, terminal, quiet, verbose, move || started.elapsed());
+        if let Some(session) = &progress.session {
+            let display = session.display.clone();
+            let (stop, receiver) = mpsc::channel();
+            let worker = thread::Builder::new()
+                .name("progress".into())
+                .spawn(move || {
+                    animate(&display, |interval| {
+                        matches!(
+                            receiver.recv_timeout(interval),
+                            Err(mpsc::RecvTimeoutError::Timeout)
+                        )
+                    });
+                });
+            if let Ok(worker) = worker {
+                *session.ticker.lock().unwrap() = Some(Ticker { stop, worker });
+            }
+        }
+        progress
+    }
+
+    fn with_clock(
+        writer: impl Write + Send + 'static,
+        terminal: bool,
+        quiet: bool,
+        verbose: bool,
+        clock: impl Fn() -> Duration + Send + 'static,
+    ) -> Self {
         Self {
-            output: (terminal && !quiet)
-                .then(|| Rc::new(RefCell::new(Box::new(writer) as Box<dyn Write>))),
-            verbose,
+            session: (terminal && !quiet).then(|| {
+                Arc::new(Session {
+                    display: Arc::new(Mutex::new(Display {
+                        writer: Box::new(writer),
+                        clock: Box::new(clock),
+                        verbose,
+                        message: None,
+                        waiting: None,
+                        frame: 0,
+                        state: DisplayState::Running,
+                        warnings: 0,
+                    })),
+                    ticker: Mutex::new(None),
+                })
+            }),
+        }
+    }
+
+    pub fn stop(&self) {
+        let Some(session) = &self.session else { return };
+        session.stop();
+        let mut display = session.display.lock().unwrap();
+        if display.state == DisplayState::Running {
+            if display.message.is_some() || display.waiting.is_some() {
+                display.clear();
+                let _ = display.writer.flush();
+            }
+            display.state = DisplayState::Stopped;
         }
     }
 
     pub fn emit(&self, event: Event) {
-        let Some(output) = &self.output else {
+        let Some(session) = &self.session else {
             return;
         };
+        if matches!(event, Event::Finished { .. }) {
+            session.stop();
+        }
+        session.display.lock().unwrap().emit(event);
+    }
+}
+
+impl Session {
+    fn stop(&self) {
+        if let Some(ticker) = self.ticker.lock().unwrap().take() {
+            let _ = ticker.stop.send(());
+            let _ = ticker.worker.join();
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.stop();
+        let mut display = self.display.lock().unwrap();
+        if display.state == DisplayState::Running
+            && (display.message.is_some() || display.waiting.is_some())
+        {
+            display.clear();
+            let _ = display.writer.flush();
+        }
+    }
+}
+
+fn animate(display: &Mutex<Display>, mut next_tick: impl FnMut(Duration) -> bool) {
+    while next_tick(TICK_INTERVAL) {
+        let mut display = display.lock().unwrap();
+        if display.state != DisplayState::Running {
+            break;
+        }
+        display.tick();
+    }
+}
+
+impl Display {
+    fn clear(&mut self) {
+        let _ = write!(self.writer, "{CLEAR_LINE}");
+    }
+
+    fn render(&mut self) {
+        if self.state != DisplayState::Running {
+            return;
+        }
+        if let Some(message) = self.waiting.as_ref().or(self.message.as_ref()) {
+            let message = message.replacen(" : ", " · ", 1);
+            let _ = write!(
+                self.writer,
+                "{CLEAR_LINE}{} {message} · {} s",
+                FRAMES[self.frame],
+                (self.clock)().as_secs()
+            );
+            let _ = self.writer.flush();
+        }
+    }
+
+    fn tick(&mut self) {
+        self.frame = (self.frame + 1) % FRAMES.len();
+        self.render();
+    }
+
+    fn emit(&mut self, event: Event) {
+        if self.state == DisplayState::Finished {
+            return;
+        }
+        if let Event::Finished { elapsed, success } = event {
+            if self.state == DisplayState::Running {
+                self.clear();
+            }
+            let _ = writeln!(
+                self.writer,
+                "{} {:.2} s · {} avertissement{}",
+                if success {
+                    "Terminé en"
+                } else {
+                    "Échec après"
+                },
+                elapsed.as_secs_f64(),
+                self.warnings,
+                if self.warnings > 1 { "s" } else { "" }
+            );
+            let _ = self.writer.flush();
+            self.state = DisplayState::Finished;
+            return;
+        }
+        if self.state == DisplayState::Stopped {
+            return;
+        }
+        if let Event::Warnings { count } = event {
+            self.warnings = count;
+            return;
+        }
+        if matches!(event, Event::Request { .. }) && self.waiting.take().is_some() {
+            self.clear();
+            self.render();
+            let _ = self.writer.flush();
+        }
+        let waiting = matches!(event, Event::Waiting { .. });
+        let detail = matches!(
+            event,
+            Event::Page { .. } | Event::Request { .. } | Event::RateLimit { .. }
+        );
+        if detail && !self.verbose {
+            return;
+        }
         let message = match event {
             Event::Identifying(source) => format!("{} : identification", source.label()),
             Event::Source(source) => format!("{} : collecte", source.label()),
@@ -72,15 +275,13 @@ impl Progress {
                 operation,
                 number,
             } => format!("{} : {operation}, page {number}", source.label()),
-            Event::Request { source, operation } if self.verbose => {
-                format!("{} : GET {operation}", source.label())
-            }
+            Event::Request { source, operation } => format!("{} : GET {operation}", source.label()),
             Event::RateLimit {
                 source,
                 remaining,
                 limit,
                 near_limit,
-            } if self.verbose => {
+            } => {
                 let remaining = remaining.map_or_else(
                     || "restant inconnu".into(),
                     |value| format!("{value} restantes"),
@@ -89,149 +290,36 @@ impl Progress {
                     || "limite inconnue".into(),
                     |value| format!("limite {value}"),
                 );
-                let near_limit = match near_limit {
-                    Some(true) => ", quota presque épuisé",
-                    _ => "",
+                let near_limit = if near_limit == Some(true) {
+                    ", quota presque épuisé"
+                } else {
+                    ""
                 };
                 format!(
                     "{} : rate limit, {remaining}, {limit}{near_limit}",
                     source.label()
                 )
             }
-            Event::Request { .. } | Event::RateLimit { .. } => return,
             Event::Waiting { source, seconds } => {
                 format!("{} : rate limit, reprise dans {seconds} s", source.label())
             }
             Event::Calculating => "Calcul des métriques".into(),
-            Event::Finished { elapsed, success } => format!(
-                "{} {:.2} s",
-                if success {
-                    "Terminé en"
-                } else {
-                    "Échec après"
-                },
-                elapsed.as_secs_f64()
-            ),
+            Event::Finished { .. } | Event::Warnings { .. } => unreachable!(),
         };
-        let mut output = output.borrow_mut();
-        let _ = writeln!(output, "{message}");
-        let _ = output.flush();
+        if self.verbose {
+            self.clear();
+            let _ = writeln!(self.writer, "{message}");
+            let _ = self.writer.flush();
+        }
+        if waiting {
+            self.waiting = Some(message);
+        } else if !detail {
+            self.message = Some(message);
+            self.waiting = None;
+        }
+        self.render();
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    #[derive(Clone, Default)]
-    struct Buffer(Rc<RefCell<Vec<u8>>>);
-
-    impl Write for Buffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.borrow_mut().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn render(terminal: bool, quiet: bool, verbose: bool) -> String {
-        let buffer = Buffer::default();
-        let progress = Progress::new(buffer.clone(), terminal, quiet, verbose);
-        progress.emit(Event::Source(Source::GitHub));
-        progress.emit(Event::Repositories {
-            source: Source::GitHub,
-            stage: "PRs",
-            current: 3,
-            total: 12,
-        });
-        progress.emit(Event::Page {
-            source: Source::GitHub,
-            operation: "recherche",
-            number: 2,
-        });
-        progress.emit(Event::Request {
-            source: Source::GitHub,
-            operation: "recherche",
-        });
-        progress.emit(Event::RateLimit {
-            source: Source::GitHub,
-            remaining: Some(42),
-            limit: Some(5000),
-            near_limit: None,
-        });
-        progress.emit(Event::Waiting {
-            source: Source::GitHub,
-            seconds: 42,
-        });
-        progress.emit(Event::Calculating);
-        progress.emit(Event::Finished {
-            elapsed: Duration::from_millis(1250),
-            success: true,
-        });
-        String::from_utf8(buffer.0.borrow().clone()).unwrap()
-    }
-
-    #[test]
-    fn non_tty_and_quiet_disable_all_output_including_verbose() {
-        for verbose in [false, true] {
-            assert_eq!(render(false, false, verbose), "");
-            assert_eq!(render(true, true, verbose), "");
-        }
-    }
-
-    #[test]
-    fn terminal_shows_stages_pages_waits_and_elapsed_summary() {
-        let output = render(true, false, false);
-        for expected in [
-            "GitHub : collecte",
-            "GitHub : PRs 3/12 dépôts",
-            "recherche, page 2",
-            "rate limit, reprise dans 42 s",
-            "Calcul des métriques",
-            "Terminé en 1.25 s",
-        ] {
-            assert!(output.contains(expected), "missing {expected}: {output}");
-        }
-        assert!(!output.contains("GET"));
-        assert!(!output.contains("restant"));
-    }
-
-    #[test]
-    fn verbose_adds_api_calls_and_numeric_rate_limit_details() {
-        let output = render(true, false, true);
-        assert!(output.contains("GitHub : GET recherche"), "{output}");
-        assert!(output.contains("42 restantes"), "{output}");
-        assert!(output.contains("limite 5000"), "{output}");
-    }
-
-    #[test]
-    fn failure_summary_does_not_claim_success() {
-        let buffer = Buffer::default();
-        Progress::new(buffer.clone(), true, false, false).emit(Event::Finished {
-            elapsed: Duration::from_secs(2),
-            success: false,
-        });
-        assert_eq!(
-            String::from_utf8(buffer.0.borrow().clone()).unwrap(),
-            "Échec après 2.00 s\n"
-        );
-    }
-
-    #[test]
-    fn unavailable_progress_output_does_not_abort_the_command() {
-        struct BrokenOutput;
-        impl Write for BrokenOutput {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                Err(std::io::ErrorKind::BrokenPipe.into())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Err(std::io::ErrorKind::BrokenPipe.into())
-            }
-        }
-        Progress::new(BrokenOutput, true, false, true).emit(Event::Calculating);
-    }
-}
+mod tests;

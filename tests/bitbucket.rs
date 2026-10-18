@@ -39,7 +39,7 @@ fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
     assert!(
         std::fs::read_to_string(log.path())
             .unwrap()
-            .contains("Bitbucket : rate limit, reprise dans 0 s")
+            .contains("Bitbucket · rate limit, reprise dans 0 s")
     );
 }
 
@@ -93,14 +93,14 @@ fn progress_tracks_repositories_and_opaque_pages_without_changing_json_or_exposi
             continue;
         }
         for expected in [
-            "Bitbucket : collecte",
+            "Bitbucket · collecte",
             "PRs 1/2 dépôts",
             "PRs 2/2 dépôts",
             "commits 2/2 dépôts",
-            "page 2",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }
+        assert_eq!(output.contains("page 2"), verbose);
         assert_eq!(output.contains("GET"), verbose);
         assert_eq!(output.contains("limite 1000"), verbose);
         assert_eq!(output.contains("quota presque épuisé"), verbose);
@@ -221,7 +221,7 @@ fn basic_auth_survives_rate_limit_retry_and_redirect_with_progress() {
     identity.assert();
     repositories.assert();
     let output = std::fs::read_to_string(log.path()).unwrap();
-    assert!(output.contains("Bitbucket : rate limit, reprise dans 0 s"));
+    assert!(output.contains("Bitbucket · rate limit, reprise dans 0 s"));
     for secret in ["fake-bitbucket-token", "alice@example.test", authorization] {
         assert!(!output.contains(secret));
     }

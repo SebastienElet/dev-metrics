@@ -57,4 +57,9 @@ Pour les autres options et les commandes d'activité brute, consultez
 `dev-metrics --help` puis l'aide de chaque commande. `dev-metrics schema` affiche
 le schéma JSON du rapport pour les intégrations et les agents.
 
-`--quiet` désactive la progression ; `--verbose` détaille les appels API sur stderr, uniquement dans un terminal (`--quiet` prioritaire).
+Dans un terminal, un spinner sur stderr affiche l'étape, le compteur et le temps écoulé
+sur une seule ligne. Il est effacé avant les avertissements et le résumé final
+(durée et nombre d'avertissements), y compris en cas d'erreur.
+`--quiet` désactive la progression ; `--verbose` ajoute le détail des étapes,
+appels API, pages et quotas (`--quiet` prioritaire). Hors terminal, la progression
+reste silencieuse. Les formats de stdout et les avertissements structurés sont inchangés.

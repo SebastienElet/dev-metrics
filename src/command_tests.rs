@@ -672,10 +672,20 @@ fn partial_statistics_warnings_survive_quiet_and_non_tty_progress() {
             } else {
                 baseline = Some(stdout.clone());
             }
+            progress.emit(Event::Finished {
+                elapsed: std::time::Duration::from_secs(2),
+                success: true,
+            });
             let stderr = std::fs::read_to_string(log.path()).unwrap();
+            if terminal && !quiet {
+                assert!(
+                    stderr.ends_with("Terminé en 2.00 s · 1 avertissement\n"),
+                    "{stderr:?}"
+                );
+            }
             let warning_lines = stderr
                 .lines()
-                .filter(|line| line.starts_with('{'))
+                .filter_map(|line| line.find('{').map(|start| &line[start..]))
                 .collect::<Vec<_>>();
             let warning = if format == "json" {
                 assert!(warning_lines.is_empty());
@@ -693,4 +703,24 @@ fn partial_statistics_warnings_survive_quiet_and_non_tty_progress() {
             }
         }
     }
+}
+
+#[test]
+fn warnings_are_separated_from_the_active_spinner() {
+    let (_directory, cli) = cli(&["report", "--format", "table"], "");
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let progress = Progress::new(log.as_file().try_clone().unwrap(), true, false, false);
+    run_with_warnings(
+        &progress,
+        cli,
+        today(),
+        |_, _, _| Ok(Box::new(WarningSource)),
+        &mut log.as_file().try_clone().unwrap(),
+    )
+    .unwrap();
+    let stderr = std::fs::read_to_string(log.path()).unwrap();
+    let (before_warning, warning) = stderr.split_once('{').unwrap();
+    assert!(before_warning.ends_with("\r\x1b[2K"), "{stderr:?}");
+    assert!(!warning.contains('\r'), "{stderr:?}");
+    serde_json::from_str::<Value>(&format!("{{{warning}")).unwrap();
 }

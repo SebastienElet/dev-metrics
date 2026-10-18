@@ -22,7 +22,7 @@ fn authenticated_identity_has_progress_before_collection() {
     assert!(
         std::fs::read_to_string(log.path())
             .unwrap()
-            .contains("GitHub : identification")
+            .contains("GitHub · identification")
     );
 }
 
@@ -51,7 +51,7 @@ fn authenticated_requests_preserve_credentials_when_retried_after_rate_limit() {
     assert!(
         std::fs::read_to_string(log.path())
             .unwrap()
-            .contains("GitHub : rate limit, reprise dans 0 s")
+            .contains("GitHub · rate limit, reprise dans 0 s")
     );
 }
 
@@ -103,14 +103,14 @@ fn progress_tracks_repositories_and_pages_without_changing_json_or_exposing_secr
             continue;
         }
         for expected in [
-            "GitHub : collecte",
+            "GitHub · collecte",
             "PRs et commentaires 1/2 dépôts",
             "PRs et commentaires 2/2 dépôts",
-            "page 2",
             "commits 0/0 dépôts",
         ] {
             assert!(output.contains(expected), "missing {expected}: {output}");
         }
+        assert_eq!(output.contains("page 2"), verbose);
         assert_eq!(output.contains("GET"), verbose);
         assert!(!output.contains("test-token"));
     }
