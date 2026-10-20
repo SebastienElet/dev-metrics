@@ -15,7 +15,7 @@ tempfile = "=3.27.0"
 toml = "=1.1.8"
 
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.190"
+libc = "=0.2.191"
 
 [target.'cfg(windows)'.dependencies]
 rpassword = "=7.5.4"
