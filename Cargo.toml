@@ -21,5 +21,5 @@ libc = "=0.2.190"
 rpassword = "=7.5.4"
 
 [dev-dependencies]
-jsonschema = { version = "=0.58.6", default-features = false }
+jsonschema = { version = "=0.59.0", default-features = false }
 mockito = "=1.7.2"
